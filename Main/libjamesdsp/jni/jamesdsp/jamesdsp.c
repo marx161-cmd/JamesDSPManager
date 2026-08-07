@@ -11,6 +11,8 @@
 #include "essential.h"
 // Effect section
 #include "jdsp/jdsp_header.h"
+#include "lua_bridge.h"
+#include "lsp_wrap.h"
 typedef struct
 {
 	unsigned long long initializeForFirst;
@@ -316,42 +318,6 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				*replyData = 0;
 				return 0;
 			}
-			else if (cmd == 1200)
-			{
-				int16_t compressorEnabled = ((int16_t *)cep)[8];
-				if (!compressorEnabled)
-					CompressorDisable(&dspmain->jdsp);
-				else
-					CompressorEnable(&dspmain->jdsp, 1);
-#ifdef DEBUG
-				LOGE("Compressor enabled: %d", compressorEnabled);
-#endif
-				*replyData = 0;
-				return 0;
-			}
-			else if (cmd == 1201)
-			{
-				int16_t bassBoostEnabled = ((int16_t *)cep)[8];
-				if (!bassBoostEnabled)
-					BassBoostDisable(&dspmain->jdsp);
-				else
-					BassBoostEnable(&dspmain->jdsp);
-#ifdef DEBUG
-				LOGE("Bass boost enabled: %d", bassBoostEnabled);
-#endif
-				*replyData = 0;
-				return 0;
-			}
-			else if (cmd == 112)
-			{
-				float maxg = ((int16_t *)cep)[8];
-#ifdef DEBUG
-				LOGE("Bass boost max gain: %f", maxg);
-#endif
-				BassBoostSetParam(&dspmain->jdsp, maxg);
-				*replyData = 0;
-				return 0;
-			}
 			else if (cmd == 1202)
 			{
 				int16_t equalizerEnabled = ((int16_t *)cep)[8];
@@ -563,6 +529,48 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				*replyData = 0;
 				return 0;
 			}
+			else if (cmd == 10020) // Load Lua script from accumulated string
+			{
+				dspmain->stringIndex = 0;
+				if (dspmain->stringEq)
+				{
+					lua_bridge_load_script(dspmain->stringEq);
+					free(dspmain->stringEq);
+					dspmain->stringEq = 0;
+				}
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 10021) // Unload Lua script
+			{
+				lua_bridge_destroy();
+				lua_bridge_init();
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 10100) // Gate: enabled, open_db, close_db, attack, release, hold, reduct
+			{
+				float *p = (float *)cep;
+				int en = (int)roundf(p[5]);
+				dspmain->jdsp.gateEnabled = en;
+				if (en) lsp_gate_configure(dspmain->jdsp.gate_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 10101) // Compressor: enabled, threshold, ratio, knee, attack, release, hold
+			{
+				float *p = (float *)cep;
+				int en = (int)roundf(p[5]);
+				dspmain->jdsp.mbDynEnabled = en;
+				if (en) lsp_comp_configure(dspmain->jdsp.compressor_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 10102) // MB EQ: (no-op, single-band)
+			{
+				*replyData = 0;
+				return 0;
+			}
 		}
 		if (cep->psize == 4 && cep->vsize == 4)
 		{
@@ -625,36 +633,6 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 #ifdef DEBUG
 				LOGE("limThreshold: %f, limRelease: %f, postgain: %f", limThreshold, limRelease, postgain);
 #endif
-				*replyData = 0;
-				return 0;
-			}
-		}
-		if (cep->psize == 4 && cep->vsize == 68)
-		{
-			int32_t cmd = ((int32_t *)cep)[3];
-			if (cmd == 115)
-			{
-				float timeconstant = ((float*)cep)[4 + 0];
-				int granularity = (int)roundf(((float*)cep)[4 + 1]);
-				int tfresolution = (int)roundf(((float*)cep)[4 + 2]);
-				float *ptrFreqAxis = &((float*)cep)[4 + 3];
-				float *ptrGainAxis = ptrFreqAxis + 7;
-				double param[14];
-				for (int i = 0; i < 7; i++)
-				{
-					param[i] = (double)ptrFreqAxis[i];
-					param[i + 7] = (double)ptrGainAxis[i];
-				}
-#ifdef DEBUG
-				LOGI("Compander timeconstant = %1.8f", timeconstant);
-				LOGI("Compander granularity = %d", granularity);
-				LOGI("Compander tfresolution = %d", tfresolution);
-				LOGI("Compander axis: ");
-				for (int i = 0; i < 7; i++)
-					LOGI("%1.7lf %1.7lf; ", param[i], param[i + 7]);
-#endif
-				CompressorSetParam(&dspmain->jdsp, timeconstant, granularity, tfresolution, 0);
-				CompressorSetGain(&dspmain->jdsp, param, param + 7, 1);
 				*replyData = 0;
 				return 0;
 			}

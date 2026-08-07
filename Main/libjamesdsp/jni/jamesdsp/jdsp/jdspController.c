@@ -7,6 +7,9 @@
 #include "Effects/eel2/dr_flac.h"
 #include "Effects/eel2/ns-eel.h"
 #include "jdsp_header.h"
+#include "lua_bridge.h"
+#include "lsp_wrap.h"
+#include "chain_modules.h"
 #define TAG "EffectDSPMain"
 
 #ifdef __ANDROID_API__
@@ -235,6 +238,55 @@ void JamesDSPGlobalMemoryDeallocation()
 {
 	NSEEL_quit();
 }
+// --- Lua band-energy meter -------------------------------------------------
+// Analysis-only RBJ constant-skirt-gain bandpass (peak gain = Q), Direct
+// Form II Transposed. Runs on a downmix COPY inside JamesDSPProcess, never
+// writes back into tmpBuffer, so it can never alter real playback the way
+// inserting a filter into a real signal graph (e.g. mpv's `af`) would.
+// Band 0 = bass. Coeffs only recomputed when fs changes (cheap, 30Hz tick).
+#define LUA_BAND_METER_BASS_HZ (90.0)
+#define LUA_BAND_METER_BASS_Q  (0.9)
+static float g_bandMeterB0[LUA_BAND_METER_COUNT], g_bandMeterB2[LUA_BAND_METER_COUNT];
+static float g_bandMeterA1[LUA_BAND_METER_COUNT], g_bandMeterA2[LUA_BAND_METER_COUNT];
+static void bandmeter_update_coeffs(double fs, double centerHz, double Q, int idx)
+{
+	double w0 = 2.0 * M_PI * centerHz / fs;
+	double alpha = sin(w0) / (2.0 * Q);
+	double a0 = 1.0 + alpha;
+	g_bandMeterB0[idx] = (float)((Q * alpha) / a0);
+	g_bandMeterB2[idx] = (float)((-Q * alpha) / a0);
+	g_bandMeterA1[idx] = (float)((-2.0 * cos(w0)) / a0);
+	g_bandMeterA2[idx] = (float)((1.0 - alpha) / a0);
+}
+// Flush-to-zero for denormals: reverb tails, delay lines, and IIR filter
+// state decaying toward silence routinely produce denormal floats, which
+// stall to slow microcoded handling on ARM cores instead of running at
+// normal speed. FPCR's FZ bit (AArch64) flushes both denormal inputs and
+// denormal results to zero for standard-precision float ops — audibly
+// silent difference (denormals are already far below the noise floor), real
+// CPU/battery win. Per-thread state, so this must run on whatever thread
+// actually calls JamesDSPProcess(), not just once at init — cost is two
+// register moves, negligible against a full chain_process() call.
+#if defined(__aarch64__)
+static inline void jdsp_enable_ftz(void)
+{
+	uint64_t fpcr;
+	__asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+	fpcr |= (1ULL << 24); // FZ
+	__asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
+}
+#elif defined(__arm__)
+static inline void jdsp_enable_ftz(void)
+{
+	uint32_t fpscr;
+	__asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+	fpscr |= (1U << 24); // FZ
+	__asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
+}
+#else
+static inline void jdsp_enable_ftz(void) {}
+#endif
+
 unsigned int next_pow_2(unsigned int x)
 {
 	if (x <= 1) return 1;
@@ -306,136 +358,153 @@ void jdsp_unlock(JamesDSPLib *jdsp)
 	if (jdsp->isMutexSuccess)
 		pthread_mutex_unlock(&jdsp->m_in_processing);
 }
+// JLimiter stubs (old limiter replaced by LSP, symbols stripped from dynamic.c)
+void JLimiterInit(JamesDSPLib *d) { (void)d; d->limiter_handle = lsp_limiter_create((float)d->fs); }
+void JLimiterSetCoefficients(JamesDSPLib *d, double threshold_db, double release) {
+	// Real reference plugin constants (lsp-plugins-limiter meta/limiter.h):
+	// ATTACK_TIME_MIN=0.25ms, ATTACK_TIME_DFL=5.0ms; RELEASE_TIME_MIN=0.25ms,
+	// RELEASE_TIME_MAX=20.0ms. This previously hardcoded attack to 0.25ms —
+	// the plugin's *minimum* allowed value, not a real default — making
+	// every limiter instance run the most aggressive attack the algorithm
+	// supports. That's an implausibly fast gain-reduction ramp for normal
+	// program material and is a real candidate for audible distortion on
+	// sharp transients. Use the real default attack, and clamp release to
+	// the range the reference plugin was actually designed/tested for
+	// (the UI's own release range predates this and can exceed it).
+	double clamped_release = release;
+	if (clamped_release < 0.25) clamped_release = 0.25;
+	if (clamped_release > 20.0) clamped_release = 20.0;
+	lsp_limiter_configure(d->limiter_handle, (float)threshold_db, 5.0f, (float)clamped_release, 1.0f);
+}
+
+// Chain module wrappers — bridge (float*,float*,unsigned) → (JamesDSPLib*,size_t)
+
+static JamesDSPLib *g_chain_jdsp = NULL;
+
+static void w_tube(float *L, float *R, unsigned n)      { (void)L; (void)R; VacuumTubeProcess(g_chain_jdsp, n); }
+static void w_eq(float *L, float *R, unsigned n)         { (void)L; (void)R; MultimodalEqualizerProcess(g_chain_jdsp, n); }
+static void w_arb_eq(float *L, float *R, unsigned n)     { (void)L; (void)R; ArbitraryResponseEqualizerProcess(g_chain_jdsp, n); }
+static void w_conv(float *L, float *R, unsigned n)       { (void)L; (void)R; if (g_chain_jdsp->conv.process) g_chain_jdsp->conv.process(g_chain_jdsp, n); }
+static void w_ddc(float *L, float *R, unsigned n)        { (void)L; (void)R; DDCProcess(g_chain_jdsp, n); }
+static void w_liveprog(float *L, float *R, unsigned n)   { (void)L; (void)R; LiveProgProcess(g_chain_jdsp, n); }
+static void w_crossfeed(float *L, float *R, unsigned n)  { (void)L; (void)R; CrossfeedProcess(g_chain_jdsp, n); }
+static void w_stereo(float *L, float *R, unsigned n)     { (void)L; (void)R; StereoEnhancementProcess(g_chain_jdsp, n); }
+static void w_reverb(float *L, float *R, unsigned n)     { (void)L; (void)R; ReverbProcess(g_chain_jdsp, n); }
+// Legacy Dynamic Bass Boost (dbb.c) — restored as an opt-in module, off by
+// default. Algorithm was never deleted, only unwired; kept for people who
+// prefer it over relying on EQ for bass shaping.
+static void w_bassboost(float *L, float *R, unsigned n)  { (void)L; (void)R; BassBoostProcess(g_chain_jdsp, n); }
+// Compressor/Gate now own a real Bypass crossfade internally (lsp_wrap.cpp)
+// instead of being hard-skipped by chain_process() when disabled — that
+// hard skip made enabling/disabling either from the UI an instant step in
+// gain, audible as a click. They're always called now; each is a near-zero
+// -cost no-op once its own Bypass has settled fully disabled.
+static void w_mb_dyn(float *L, float *R, unsigned n)     { lsp_comp_process(g_chain_jdsp->compressor_handle, L, R, n, g_chain_jdsp->mbDynEnabled); }
+static void w_gate_lsp(float *L, float *R, unsigned n)   { lsp_gate_process(g_chain_jdsp->gate_handle, L, R, n, g_chain_jdsp->gateEnabled); }
+// No chain wrapper for the limiter: it's applied once, explicitly, at the
+// end of JamesDSPProcess() after postGain — that's the real "last line of
+// defense" position. It used to ALSO run mid-chain via chain_register()
+// below (pre-postGain), meaning the same stateful lsp::dspu::Limiter
+// instance processed two different signals per audio block, corrupting its
+// lookahead delay line every callback. Removed from the chain; the
+// explicit call at the end of JamesDSPProcess() is now the only call.
+
+static int g_chain_initialized = 0;
+static void chain_init_static(void) {
+	if (g_chain_initialized) return;
+	g_chain_initialized = 1;
+
+	chain_register("autogain",   autogain_process,   &g_chain_jdsp->autogainEnabled);
+	// gate/compressor: NULL toggle here is deliberate — chain_process()
+	// must always call them so their internal Bypass crossfade can run
+	// during the ~5ms enable/disable transition. They self-gate via
+	// lsp_wrap.cpp's Bypass (near-zero cost once fully settled disabled),
+	// not via chain_process()'s hard skip.
+	chain_register("gate",       w_gate_lsp,         NULL);
+	chain_register("tube",       w_tube,             &g_chain_jdsp->tubeEnabled);
+	chain_register("compressor", w_mb_dyn,           NULL);
+	chain_register("bassboost",  w_bassboost,        &g_chain_jdsp->bassBoostEnabled);
+	chain_register("eq",         w_eq,               &g_chain_jdsp->equalizerEnabled);
+	chain_register("arb_eq",     w_arb_eq,           &g_chain_jdsp->arbitraryMagEnabled);
+	chain_register("convolver",  w_conv,             &g_chain_jdsp->convolverEnabled);
+	chain_register("ddc",        w_ddc,              &g_chain_jdsp->ddcEnabled);
+	chain_register("liveprog",   w_liveprog,         &g_chain_jdsp->liveprogEnabled);
+	chain_register("crossfeed",  w_crossfeed,        &g_chain_jdsp->crossfeedEnabled);
+	chain_register("stereo",     w_stereo,           &g_chain_jdsp->sterEnhEnabled);
+	chain_register("reverb",     w_reverb,           &g_chain_jdsp->reverbEnabled);
+
+	// Order matches stock's original chain position: bass boost right after
+	// the compressor, before EQ.
+	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+	chain_set_order(default_order, 13);
+}
+
 // Process
 void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 {
-	// Analog modelling
-	if (jdsp->tubeEnabled)
-		VacuumTubeProcess(jdsp, n);
-	// Input / Compressor
-	if (jdsp->compEnabled)
-		CompressorProcess(jdsp, n);
-	// IIR bass boost
-	if (jdsp->bassBoostEnabled)
-		BassBoostProcess(jdsp, n);
-	// Equalizer
-	if (jdsp->equalizerEnabled)
-		MultimodalEqualizerProcess(jdsp, n);
-	// Arbitrary magnitude eq
-	if (jdsp->arbitraryMagEnabled)
-		ArbitraryResponseEqualizerProcess(jdsp, n);
-	jdsp_lock(jdsp);
-	// Convolver
-	if (jdsp->convolverEnabled)
-		if (jdsp->conv.process)
-			jdsp->conv.process(jdsp, n);
-	// Viper DDC
-	if (jdsp->ddcEnabled)
-		DDCProcess(jdsp, n);
-	// Live programmable
-	if (jdsp->liveprogEnabled)
-		LiveProgProcess(jdsp, n);
-	jdsp_unlock(jdsp);
-	// BS2B
-	if (jdsp->crossfeedEnabled)
-		CrossfeedProcess(jdsp, n);
-	// Stereo widening
-	if (jdsp->sterEnhEnabled)
-		StereoEnhancementProcess(jdsp, n);
-	// Reverb
-	if (jdsp->reverbEnabled)
-		ReverbProcess(jdsp, n);
-	// Output
-	for (size_t i = 0; i < n; i++)
-	{
-		float xL = jdsp->tmpBuffer[0][i] * jdsp->postGain;
-		float xR = jdsp->tmpBuffer[1][i] * jdsp->postGain;
-		float rect1 = fabsf(xL);
-		float rect2 = fabsf(xR);
-		float maxLR = max(rect1, rect2);
-		if (maxLR < jdsp->limiter.threshold)
-			maxLR = jdsp->limiter.threshold;
-		if (maxLR > jdsp->limiter.envOverThreshold)
-			jdsp->limiter.envOverThreshold = maxLR;
-		else
-			jdsp->limiter.envOverThreshold = maxLR + jdsp->limiter.relCoef * (jdsp->limiter.envOverThreshold - maxLR);
-		float gR = jdsp->limiter.threshold / jdsp->limiter.envOverThreshold;
-		rect1 = xL * gR;
-		rect2 = xR * gR;
-		jdsp->tmpBuffer[0][i] = rect1;
-		jdsp->tmpBuffer[1][i] = rect2;
+	jdsp_enable_ftz();
+	g_chain_jdsp = jdsp;
+	chain_init_static();
+
+	// Run the chain
+	chain_process(jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
+
+	// Lua scripting tick — 30Hz
+	if (jdsp->luaTickCounter <= 0) {
+		if (jdsp->bandMeterCoeffFs != jdsp->fs) {
+			bandmeter_update_coeffs(jdsp->fs, LUA_BAND_METER_BASS_HZ, LUA_BAND_METER_BASS_Q, 0);
+			jdsp->bandMeterCoeffFs = jdsp->fs;
+		}
+		float b0 = g_bandMeterB0[0], b2 = g_bandMeterB2[0];
+		float a1 = g_bandMeterA1[0], a2 = g_bandMeterA2[0];
+		float w1 = jdsp->bandMeterState1[0], w2 = jdsp->bandMeterState2[0];
+		float rms = 0.0f;
+		double bassSum = 0.0;
+		for (size_t i = 0; i < n; i++) {
+			// Full-spectrum + band taps both read the post-chain mix
+			// (a value), never write it back — analysis only.
+			float mono = (jdsp->tmpBuffer[0][i] + jdsp->tmpBuffer[1][i]) * 0.5f;
+			rms += mono * mono;
+			float bandY = b0 * mono + w1;
+			w1 = -a1 * bandY + w2; // b1 == 0 for this bandpass form
+			w2 = b2 * mono - a2 * bandY;
+			bassSum += (double)bandY * (double)bandY;
+		}
+		jdsp->bandMeterState1[0] = w1;
+		jdsp->bandMeterState2[0] = w2;
+		rms = sqrtf(rms / (float)n);
+		float bandEnergies[LUA_BAND_METER_COUNT];
+		bandEnergies[0] = sqrtf((float)(bassSum / (double)n));
+		lua_bridge_set_audio_level(rms);
+		lua_bridge_set_bands(bandEnergies, LUA_BAND_METER_COUNT);
+		lua_bridge_set_sample_rate((int)jdsp->fs);
+		lua_bridge_set_postgain(jdsp->postGain);
+		// Order must match g_module_names[] in lua_bridge.c
+		int moduleStates[12] = {
+			jdsp->gateEnabled, jdsp->mbDynEnabled, jdsp->autogainEnabled,
+			jdsp->reverbEnabled, jdsp->sterEnhEnabled, jdsp->tubeEnabled,
+			jdsp->convolverEnabled, jdsp->equalizerEnabled, jdsp->crossfeedEnabled,
+			jdsp->ddcEnabled, jdsp->arbitraryMagEnabled, jdsp->liveprogEnabled
+		};
+		lua_bridge_set_module_states(moduleStates, 12);
+		lua_bridge_tick(NULL, (int)n);
+		jdsp->luaTickCounter = jdsp->luaTickInterval;
+	} else {
+		jdsp->luaTickCounter--;
 	}
+
+	// Output limiter (LSP brickwall)
+	for (size_t i = 0; i < n; i++) {
+		jdsp->tmpBuffer[0][i] *= jdsp->postGain;
+		jdsp->tmpBuffer[1][i] *= jdsp->postGain;
+	}
+	lsp_limiter_process(jdsp->limiter_handle, jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
 }
 void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 {
-	// Analog modelling
-	if (jdsp->tubeEnabled)
-		VacuumTubeProcess(jdsp, n);
-	// Input / Compressor
-	if (jdsp->compEnabled)
-		CompressorProcess(jdsp, n);
-	// IIR bass boost
-	if (jdsp->bassBoostEnabled)
-		BassBoostProcess(jdsp, n);
-	// Equalizer
-	if (jdsp->equalizerEnabled)
-		MultimodalEqualizerProcess(jdsp, n);
-	// Arbitrary magnitude eq
-	if (jdsp->arbitraryMagEnabled)
-		ArbitraryResponseEqualizerProcess(jdsp, n);
-	jdsp_lock(jdsp);
-	// Convolver
-	if (jdsp->convolverEnabled)
-		if (jdsp->conv.process)
-			jdsp->conv.process(jdsp, n);
-	// Viper DDC
-	if (jdsp->ddcEnabled)
-		DDCProcess(jdsp, n);
-	// Live programmable
-	if (jdsp->liveprogEnabled)
-		LiveProgProcess(jdsp, n);
-	jdsp_unlock(jdsp);
-	// BS2B
-	if (jdsp->crossfeedEnabled)
-		CrossfeedProcess(jdsp, n);
-	// Stereo widening
-	if (jdsp->sterEnhEnabled)
-		StereoEnhancementProcess(jdsp, n);
-	// Reverb
-	if (jdsp->reverbEnabled)
-		ReverbProcess(jdsp, n);
-	// Output
-	for (size_t i = 0; i < n; i++)
-	{
-		float xL = jdsp->tmpBuffer[0][i] * jdsp->postGain;
-		float xR = jdsp->tmpBuffer[1][i] * jdsp->postGain;
-		float rect1 = fabsf(xL);
-		float rect2 = fabsf(xR);
-		float maxLR = max(rect1, rect2);
-		if (maxLR < jdsp->limiter.threshold)
-			maxLR = jdsp->limiter.threshold;
-		if (maxLR > jdsp->limiter.envOverThreshold)
-			jdsp->limiter.envOverThreshold = maxLR;
-		else
-			jdsp->limiter.envOverThreshold = maxLR + jdsp->limiter.relCoef * (jdsp->limiter.envOverThreshold - maxLR);
-		float gR = jdsp->limiter.threshold / jdsp->limiter.envOverThreshold;
-		rect1 = xL * gR;
-		rect2 = xR * gR;
-		jdsp->tmpBuffer[0][i] = rect1;
-		jdsp->tmpBuffer[1][i] = rect2;
-	}
-	if (benchmarkCompletionFlag == 1)
-	{
-#ifdef DEBUG
-		__android_log_print(ANDROID_LOG_INFO, TAG, "Benchmark flag == 1, refreshing convolutions");
-#endif
-		JamesDSPRefreshConvolutions(jdsp, 0);
-		jdsp->processInternal = JamesDSPProcess;
-	}
-}
-size_t iabs(size_t value)
-{
-	return value < 0 ? 0 - value : value;
+	g_chain_jdsp = jdsp;
+	chain_init_static();
+	chain_process(jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
 }
 void sample_ratio(unsigned long long numerator, unsigned long long denominator, unsigned long long *num, unsigned long long *denom)
 {
@@ -1053,6 +1122,11 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	// Init buffer
 	jdsp->blockSize = n;
 	jdsp->blockSizeMax = n;
+	// Lua tick interval: aim for ~30Hz, adapt to block size
+	jdsp->luaTickInterval = (int)(jdsp->fs / (float)n / 30.0f);
+	if (jdsp->luaTickInterval < 1) jdsp->luaTickInterval = 1;
+	jdsp->luaTickCounter = jdsp->luaTickInterval;
+	jdsp->luaScript = NULL;
 	// Function pointer
 	jdsp->processInt16Deinterleaved = pint16;
 	jdsp->processInt32Deinterleaved = pint32;
@@ -1108,8 +1182,6 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	jdsp->postGain = 1.0f;
 	// Init effect
 	LiveProgConstructor(jdsp);
-	CompressorConstructor(jdsp);
-	CompressorDisable(jdsp);
 	BassBoostConstructor(jdsp);
 	BassBoostDisable(jdsp);
 	ReverbDisable(jdsp);
@@ -1145,6 +1217,13 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 		__android_log_print(ANDROID_LOG_INFO, TAG, "%1.7lf,%1.7lf", convbench_c0[s], convbench_c1[s]);
 	__android_log_print(ANDROID_LOG_INFO, TAG, "Printing benchmark data end");
 #endif
+	lua_bridge_init();
+	if (jdsp->luaScript && jdsp->luaScript[0])
+		lua_bridge_load_script(jdsp->luaScript);
+	jdsp->compressor_handle = lsp_comp_create(sample_rate);
+	jdsp->gate_handle = lsp_gate_create(sample_rate);
+	lsp_gate_configure(jdsp->gate_handle, -40.0f, -50.0f, 1.0f, 50.0f, 10.0f, -60.0f);
+	lsp_comp_configure(jdsp->compressor_handle, -24.0f, 4.0f, 1.0f, 5.0f, 100.0f, 10.0f);
 }
 void JamesDSPSetPostGain(JamesDSPLib *jdsp, double pGaindB)
 {
@@ -1203,7 +1282,7 @@ void JamesDSPSetSampleRate(JamesDSPLib *jdsp, float new_sample_rate, int forceRe
 		jdsp->fs = jdsp->trueSampleRate;
 	}
 	JamesDSPRefreshBlob(jdsp, jdsp->fs);
-	if (forceRefresh)
+		if (forceRefresh)
 	{
 		BassBoostSetParam(jdsp, jdsp->dbb.maxGain);
 		jdsp->ddcForceRefresh = 1;
@@ -1214,8 +1293,6 @@ void JamesDSPSetSampleRate(JamesDSPLib *jdsp, float new_sample_rate, int forceRe
 		ArbitraryResponseEqualizerEnable(jdsp, jdsp->arbitraryMagEnabled);
 		jdsp->equalizerForceRefresh = 1;
 		MultimodalEqualizerEnable(jdsp, jdsp->equalizerEnabled);
-		jdsp->compForceRefresh = 1;
-		CompressorEnable(jdsp, jdsp->compEnabled);
 		StereoEnhancementRefresh(jdsp);
 	}
 	jdsp_unlock(jdsp);
@@ -1223,8 +1300,18 @@ void JamesDSPSetSampleRate(JamesDSPLib *jdsp, float new_sample_rate, int forceRe
 void JamesDSPFree(JamesDSPLib *jdsp)
 {
 	jdsp_lock(jdsp);
+	lua_bridge_destroy();
+	lsp_comp_destroy(jdsp->compressor_handle);
+	lsp_gate_destroy(jdsp->gate_handle);
+	lsp_limiter_destroy(jdsp->limiter_handle);
+	jdsp->compressor_handle = NULL;
+	jdsp->gate_handle = NULL;
+	jdsp->limiter_handle = NULL;
+	if (jdsp->luaScript) {
+		free(jdsp->luaScript);
+		jdsp->luaScript = NULL;
+	}
 	StereoEnhancementDestructor(jdsp);
-	CompressorDestructor(jdsp);
 	LiveProgDestructor(jdsp);
 	DDCDestructor(jdsp);
 	CrossfeedDestructor(jdsp);

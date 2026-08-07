@@ -10,6 +10,10 @@
 #include "Effects/eel2/eelCommon.h"
 #include "generalDSP/ArbFIRGen.h"
 #define MAX_BENCHMARK (10)
+// Lua band-energy meter: number of analysis-only band taps (see JamesDSPLib
+// below + lua_bridge_set_bands()). Index 0 = bass. Bump this and add a
+// coefficient case in JamesDSPProcess() to add mid/treble taps later.
+#define LUA_BAND_METER_COUNT (1)
 // Misc
 extern double mapVal(double x, double in_min, double in_max, double out_min, double out_max);
 extern double mag2dB(double lin);
@@ -505,10 +509,20 @@ typedef struct dspsys
 	IntegerASRCHandler asrc[2];
 	float trueSampleRate, fs;
 	// Effect
-	// Compressor
-	int compEnabled, compForceRefresh;
-	FFTCompander comp;
-	// Bass boost
+	// Multiband dynamics (LSP — replaces Compressor + BassBoost)
+	int mbDynEnabled;
+	// Gate (LSP) — was chain_register()'d with a hardcoded NULL toggle,
+	// meaning it ran unconditionally on every block regardless of any UI
+	// state. This field is what makes that toggle real.
+	int gateEnabled;
+	// AutoGain (legacy, chain_modules.c) — same issue as Gate above: was
+	// chain_register()'d with NULL, ran unconditionally with no way to
+	// turn it off. No UI/AIDL cmd reaches this yet (pending the real
+	// libebur128 port), so it defaults off via the struct's zero-init.
+	int autogainEnabled;
+	// Bass boost (legacy dbb.c, restored 2026-08-07 as an opt-in module —
+	// algorithm was never deleted, only its wiring; defaults off via the
+	// struct's zero-init, same pattern as autogain above).
 	int bassBoostEnabled;
 	DBB dbb;
 	// Equalizer
@@ -540,7 +554,9 @@ typedef struct dspsys
 	arbitraryMagnitude arbMag;
 	// Output limiter
 	float postGain;
-	JLimiter limiter;
+	void *limiter_handle;
+	void *compressor_handle;
+	void *gate_handle;
 	size_t blockSize, blockSizeMax, pw2BlockMemSize;
 	float *tmpBuffer[6];
 	// Internal function pointer
@@ -572,6 +588,18 @@ typedef struct dspsys
 	pthread_mutex_t m_in_processing;
 	// Random number and related
 	uint64_t rndstate[2];
+	// Lua scripting bridge
+	char *luaScript;
+	int luaTickCounter;
+	int luaTickInterval;
+	// Lua band-energy meter: analysis-only bandpass taps, run on a downmix
+	// copy so they never touch tmpBuffer/real output (unlike mpv's af-graph,
+	// which can't branch a filtered copy without altering real playback).
+	// Direct Form II Transposed biquad state per band; coeffs recomputed
+	// only when fs changes.
+	float bandMeterState1[LUA_BAND_METER_COUNT];
+	float bandMeterState2[LUA_BAND_METER_COUNT];
+	double bandMeterCoeffFs;
 } JamesDSPLib;
 // JamesDSP controller
 extern void JamesDSPGlobalMemoryAllocation();
@@ -591,15 +619,7 @@ extern int selectConvPartitions(JamesDSPLib *jdsp, unsigned int impulseLengthAct
 // Limiter
 extern void JLimiterSetCoefficients(JamesDSPLib *jdsp, double thresholddB, double msRelease);
 extern void JLimiterInit(JamesDSPLib *jdsp);
-// Compressor
-extern void CompressorConstructor(JamesDSPLib *jdsp);
-extern void CompressorDestructor(JamesDSPLib *jdsp);
-extern void CompressorSetParam(JamesDSPLib *jdsp, float fgt_facT, int granularity, int tfresolution, char forceRefresh);
-extern void CompressorSetGain(JamesDSPLib *jdsp, double *freq, double *gains, char cpy);
-extern void CompressorEnable(JamesDSPLib *jdsp, char enable);
-extern void CompressorDisable(JamesDSPLib *jdsp);
-extern void CompressorProcess(JamesDSPLib *jdsp, size_t n);
-// Bass boost
+// Bass boost (legacy dbb.c, restored as opt-in)
 extern void BassBoostEnable(JamesDSPLib *jdsp);
 extern void BassBoostDisable(JamesDSPLib *jdsp);
 extern void BassBoostConstructor(JamesDSPLib *jdsp);
