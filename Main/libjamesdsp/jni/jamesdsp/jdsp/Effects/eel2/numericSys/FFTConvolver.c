@@ -5,6 +5,7 @@
 #include <math.h>
 #include "../ns-eel.h"
 #include "codelet.h"
+
 unsigned int upper_power_of_two(unsigned int v)
 {
 	v--;
@@ -579,6 +580,31 @@ int FFTConvolver2x4x2LoadImpulseResponse(FFTConvolver2x4x2 *conv, unsigned int b
 		conv->fft = DFT524288;
 	else if (conv->_segSize == 1048576)
 		conv->fft = DFT1048576;
+	// Batched L/R FFT -- only covers 256..16384 (see FFTConvolver.h's
+	// fft_x2 comment); NULL for any other size so Process() falls back to
+	// two separate fft() calls. JDSP_SVE2_FFT_X2 (CMakeLists.txt) is only
+	// defined on arm64-v8a, where codelet.h actually declares these
+	// symbols -- on the other 3 ABIs, fft_x2 just always stays NULL.
+#if defined(JDSP_SVE2_FFT_X2)
+	if (conv->_segSize == 256)
+		conv->fft_x2 = DFT256_x2;
+	else if (conv->_segSize == 512)
+		conv->fft_x2 = DFT512_x2;
+	else if (conv->_segSize == 1024)
+		conv->fft_x2 = DFT1024_x2;
+	else if (conv->_segSize == 2048)
+		conv->fft_x2 = DFT2048_x2;
+	else if (conv->_segSize == 4096)
+		conv->fft_x2 = DFT4096_x2;
+	else if (conv->_segSize == 8192)
+		conv->fft_x2 = DFT8192_x2;
+	else if (conv->_segSize == 16384)
+		conv->fft_x2 = DFT16384_x2;
+	else
+		conv->fft_x2 = NULL;
+#else
+	conv->fft_x2 = NULL;
+#endif
 	conv->bit = (unsigned int*)malloc(conv->_segSize * sizeof(unsigned int));
 	conv->sine = (float*)malloc(conv->_segSize * sizeof(float));
 	fhtbitReversalTbl(conv->bit, conv->_segSize);
@@ -779,6 +805,31 @@ int FFTConvolver2x2LoadImpulseResponse(FFTConvolver2x2 *conv, unsigned int block
 		conv->fft = DFT524288;
 	else if (conv->_segSize == 1048576)
 		conv->fft = DFT1048576;
+	// Batched L/R FFT -- only covers 256..16384 (see FFTConvolver.h's
+	// fft_x2 comment); NULL for any other size so Process() falls back to
+	// two separate fft() calls. JDSP_SVE2_FFT_X2 (CMakeLists.txt) is only
+	// defined on arm64-v8a, where codelet.h actually declares these
+	// symbols -- on the other 3 ABIs, fft_x2 just always stays NULL.
+#if defined(JDSP_SVE2_FFT_X2)
+	if (conv->_segSize == 256)
+		conv->fft_x2 = DFT256_x2;
+	else if (conv->_segSize == 512)
+		conv->fft_x2 = DFT512_x2;
+	else if (conv->_segSize == 1024)
+		conv->fft_x2 = DFT1024_x2;
+	else if (conv->_segSize == 2048)
+		conv->fft_x2 = DFT2048_x2;
+	else if (conv->_segSize == 4096)
+		conv->fft_x2 = DFT4096_x2;
+	else if (conv->_segSize == 8192)
+		conv->fft_x2 = DFT8192_x2;
+	else if (conv->_segSize == 16384)
+		conv->fft_x2 = DFT16384_x2;
+	else
+		conv->fft_x2 = NULL;
+#else
+	conv->fft_x2 = NULL;
+#endif
 	conv->bit = (unsigned int*)malloc(conv->_segSize * sizeof(unsigned int));
 	conv->sine = (float*)malloc(conv->_segSize * sizeof(float));
 	fhtbitReversalTbl(conv->bit, conv->_segSize);
@@ -1221,9 +1272,14 @@ void FFTConvolver2x4x2Process(FFTConvolver2x4x2 *conv, const float* x1, const fl
 			conv->_fftBuffer[0][conv->bit[j]] = 0.0f;
 			conv->_fftBuffer[1][conv->bit[j]] = 0.0f;
 		}
-		conv->fft(conv->_fftBuffer[0], conv->sine);
+		if (conv->fft_x2)
+			conv->fft_x2(conv->_fftBuffer[0], conv->_fftBuffer[1], conv->sine);
+		else
+		{
+			conv->fft(conv->_fftBuffer[0], conv->sine);
+			conv->fft(conv->_fftBuffer[1], conv->sine);
+		}
 		conv->_segmentsReLeft[conv->_current][0] = conv->_fftBuffer[0][0];
-		conv->fft(conv->_fftBuffer[1], conv->sine);
 		conv->_segmentsReRight[conv->_current][0] = conv->_fftBuffer[1][0];
 		for (j = 1; j < conv->_fftComplexSize; j++)
 		{
@@ -1362,8 +1418,13 @@ void FFTConvolver2x4x2Process(FFTConvolver2x4x2 *conv, const float* x1, const fl
 			conv->_fftBuffer[1][conv->bit[symIdx]] = (realR - imagR) * 0.5f;
 		}
 		// Backward FFT
-		conv->fft(conv->_fftBuffer[0], conv->sine);
-		conv->fft(conv->_fftBuffer[1], conv->sine);
+		if (conv->fft_x2)
+			conv->fft_x2(conv->_fftBuffer[0], conv->_fftBuffer[1], conv->sine);
+		else
+		{
+			conv->fft(conv->_fftBuffer[0], conv->sine);
+			conv->fft(conv->_fftBuffer[1], conv->sine);
+		}
 
 		// Add overlap
 		float *result1 = y1 + processed;
@@ -1430,9 +1491,14 @@ void FFTConvolver2x2Process(FFTConvolver2x2 *conv, const float* x1, const float*
 			conv->_fftBuffer[0][conv->bit[j]] = 0.0f;
 			conv->_fftBuffer[1][conv->bit[j]] = 0.0f;
 		}
-		conv->fft(conv->_fftBuffer[0], conv->sine);
+		if (conv->fft_x2)
+			conv->fft_x2(conv->_fftBuffer[0], conv->_fftBuffer[1], conv->sine);
+		else
+		{
+			conv->fft(conv->_fftBuffer[0], conv->sine);
+			conv->fft(conv->_fftBuffer[1], conv->sine);
+		}
 		conv->_segmentsReLeft[conv->_current][0] = conv->_fftBuffer[0][0];
-		conv->fft(conv->_fftBuffer[1], conv->sine);
 		conv->_segmentsReRight[conv->_current][0] = conv->_fftBuffer[1][0];
 		for (j = 1; j < conv->_fftComplexSize; j++)
 		{
@@ -1559,8 +1625,13 @@ void FFTConvolver2x2Process(FFTConvolver2x2 *conv, const float* x1, const float*
 			conv->_fftBuffer[1][conv->bit[symIdx]] = (realR - imagR) * 0.5f;
 		}
 		// Backward FFT
-		conv->fft(conv->_fftBuffer[0], conv->sine);
-		conv->fft(conv->_fftBuffer[1], conv->sine);
+		if (conv->fft_x2)
+			conv->fft_x2(conv->_fftBuffer[0], conv->_fftBuffer[1], conv->sine);
+		else
+		{
+			conv->fft(conv->_fftBuffer[0], conv->sine);
+			conv->fft(conv->_fftBuffer[1], conv->sine);
+		}
 
 		// Add overlap
 		float *result1 = y1 + processed;

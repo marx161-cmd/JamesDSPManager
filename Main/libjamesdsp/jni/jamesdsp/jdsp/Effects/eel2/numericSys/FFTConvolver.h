@@ -71,6 +71,11 @@ typedef struct
 	unsigned int _inputBufferFill;
 	float gain; // float32, it's perfectly safe to have blockSize == 2097152, however, it's impractical to have such large block
 	void(*fft)(float*, const float*);
+	// Batched dual-buffer FFT for the L/R pair this convolver already
+	// processes back to back every block. NULL when _segSize has no _x2
+	// variant (only 256..16384 are covered) -- callers must check for NULL
+	// and fall back to two separate fft() calls in that case.
+	void(*fft_x2)(float*, float*, const float*);
 } FFTConvolver2x4x2;
 typedef struct
 {
@@ -97,6 +102,8 @@ typedef struct
 	unsigned int _inputBufferFill;
 	float gain; // float32, it's perfectly safe to have blockSize == 2097152, however, it's impractical to have such large block
 	void(*fft)(float*, const float*);
+	// See FFTConvolver2x4x2's fft_x2 comment -- same contract.
+	void(*fft_x2)(float*, float*, const float*);
 } FFTConvolver2x2;
 typedef struct
 {
