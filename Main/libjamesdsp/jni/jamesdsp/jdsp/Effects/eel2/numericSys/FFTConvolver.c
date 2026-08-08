@@ -830,6 +830,8 @@ int FFTConvolver2x2LoadImpulseResponse(FFTConvolver2x2 *conv, unsigned int block
 #else
 	conv->fft_x2 = NULL;
 #endif
+	// TEMP DEBUG -- crackle investigation, remove once _segSize/fft_x2 activation is confirmed on real device. grep logcat for JDSP_SEGSIZE.
+	__android_log_print(ANDROID_LOG_INFO, "JDSP_SEGSIZE", "FFTConvolver2x2 blockSize=%u segSize=%u fft_x2=%s", blockSize, conv->_segSize, conv->fft_x2 ? "ACTIVE" : "null");
 	conv->bit = (unsigned int*)malloc(conv->_segSize * sizeof(unsigned int));
 	conv->sine = (float*)malloc(conv->_segSize * sizeof(float));
 	fhtbitReversalTbl(conv->bit, conv->_segSize);

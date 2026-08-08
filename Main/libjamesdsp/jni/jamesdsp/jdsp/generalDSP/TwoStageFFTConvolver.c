@@ -3,6 +3,8 @@
 #include <string.h>
 #include <float.h>
 #include <math.h>
+#include <pthread.h>
+#include <sched.h>
 #include "../Effects/eel2/ns-eel.h"
 #include "../jdsp_header.h"
 void TwoStageFFTConvolver1x1Init(TwoStageFFTConvolver1x1 *conv)
@@ -343,6 +345,37 @@ void *task_type21x2(void *arg)
 	pthread_exit(NULL);
 	return 0;
 }
+// Tail-partition worker threads (see thread_init* below) block the audio
+// thread on every block via task_wait*() -- pthread_create(..., NULL, ...)
+// gives them plain SCHED_OTHER, no scheduling priority at all, so they
+// compete on equal footing with every other background thread on the
+// system while something latency-critical is waiting on them. This vendor
+// HAL's own init.rc grants `rlimit rtprio 10 10`, i.e. threads in this
+// process are explicitly permitted SCHED_FIFO up to priority 10 -- so
+// there's real headroom to fix this properly instead of just accepting
+// worker-thread jitter. Priority 2 is deliberately modest: enough to not
+// get starved behind ordinary SCHED_OTHER background work, but well below
+// what the actual audio mixer thread is expected to run at, so this
+// worker can't itself preempt or invert against the thread that owns the
+// real-time deadline. Falls back to default scheduling (not a hard
+// failure) if RT thread creation is denied by sepolicy in some build
+// variant -- same behavior as before this change, just without the fix.
+// No pthread_attr_setinheritsched() here -- Bionic doesn't implement it
+// (undefined symbol at link time, confirmed); unlike glibc, Bionic threads
+// don't inherit the creating thread's scheduling attributes by default, so
+// explicitly setting policy+param on the attr is sufficient on its own.
+static void create_tail_worker_thread(pthread_t *thread, void *(*start_routine)(void *), void *arg)
+{
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+	struct sched_param param;
+	param.sched_priority = 2;
+	pthread_attr_setschedparam(&attr, &param);
+	if (pthread_create(thread, &attr, start_routine, arg) != 0)
+		pthread_create(thread, NULL, start_routine, arg);
+	pthread_attr_destroy(&attr);
+}
 void thread_init1x1(TwoStageFFTConvolver1x1 *conv)
 {
 	pt_info *info = NULL;
@@ -357,7 +390,7 @@ void thread_init1x1(TwoStageFFTConvolver1x1 *conv)
 	info->_backgroundProcessingInput = conv->_backgroundProcessingInput;
 	info->_tailOutput = conv->_tailOutput;
 	info->_tailBlockSize = conv->_tailBlockSize;
-	pthread_create(&conv->threads, NULL, task_type2, (void *)info);
+	create_tail_worker_thread(&conv->threads, task_type2, (void *)info);
 	task_wait1x1(conv);
 }
 void thread_init2x4x2(TwoStageFFTConvolver2x4x2 *conv)
@@ -376,7 +409,7 @@ void thread_init2x4x2(TwoStageFFTConvolver2x4x2 *conv)
 	info->_tailOutput[0] = conv->_tailOutput[0];
 	info->_tailOutput[1] = conv->_tailOutput[1];
 	info->_tailBlockSize = conv->_tailBlockSize;
-	pthread_create(&conv->threads, NULL, task_type22x4x2, (void *)info);
+	create_tail_worker_thread(&conv->threads, task_type22x4x2, (void *)info);
 	task_wait2x4x2(conv);
 }
 void thread_init2x2(TwoStageFFTConvolver2x2 *conv)
@@ -395,7 +428,7 @@ void thread_init2x2(TwoStageFFTConvolver2x2 *conv)
 	info->_tailOutput[0] = conv->_tailOutput[0];
 	info->_tailOutput[1] = conv->_tailOutput[1];
 	info->_tailBlockSize = conv->_tailBlockSize;
-	pthread_create(&conv->threads, NULL, task_type22x2, (void *)info);
+	create_tail_worker_thread(&conv->threads, task_type22x2, (void *)info);
 	task_wait2x2(conv);
 }
 void thread_init1x2(TwoStageFFTConvolver1x2 *conv)
@@ -413,7 +446,7 @@ void thread_init1x2(TwoStageFFTConvolver1x2 *conv)
 	info->_tailOutput[0] = conv->_tailOutput[0];
 	info->_tailOutput[1] = conv->_tailOutput[1];
 	info->_tailBlockSize = conv->_tailBlockSize;
-	pthread_create(&conv->threads, NULL, task_type21x2, (void *)info);
+	create_tail_worker_thread(&conv->threads, task_type21x2, (void *)info);
 	task_wait1x2(conv);
 }
 inline void task_start1x1(TwoStageFFTConvolver1x1 *conv)
