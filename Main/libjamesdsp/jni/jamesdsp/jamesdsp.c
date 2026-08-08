@@ -318,6 +318,29 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				*replyData = 0;
 				return 0;
 			}
+			else if (cmd == 112)
+			{
+				float maxGain = (float)((int16_t *)cep)[8];
+				BassBoostSetParam(&dspmain->jdsp, maxGain);
+#ifdef DEBUG
+				LOGI("Bass boost max gain: %1.7f", maxGain);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 1201)
+			{
+				int16_t bassBoostEnabled = ((int16_t *)cep)[8];
+				if (!bassBoostEnabled)
+					BassBoostDisable(&dspmain->jdsp);
+				else
+					BassBoostEnable(&dspmain->jdsp);
+#ifdef DEBUG
+				LOGE("Bass boost enabled: %d", bassBoostEnabled);
+#endif
+				*replyData = 0;
+				return 0;
+			}
 			else if (cmd == 1202)
 			{
 				int16_t equalizerEnabled = ((int16_t *)cep)[8];
@@ -381,6 +404,13 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 #ifdef DEBUG
 				LOGE("Analogue modelling enabled: %d", analogueModelEnable);
 #endif
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 1207)
+			{
+				int16_t autogainEnabled = ((int16_t *)cep)[8];
+				dspmain->jdsp.autogainEnabled = autogainEnabled ? 1 : 0;
 				*replyData = 0;
 				return 0;
 			}
@@ -548,7 +578,20 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				*replyData = 0;
 				return 0;
 			}
-			else if (cmd == 10100) // Gate: enabled, open_db, close_db, attack, release, hold, reduct
+		}
+		// Gate/Compressor/MB-EQ (10100/10101/10102) send an 8-float payload
+		// (32 bytes) from setParameterFloatArray — these used to be
+		// (wrongly) nested inside the "vsize == 2" block above, which is
+		// sized for old 2-byte int16 commands (Reverb mode, Crossfeed
+		// mode, etc). Real cep->vsize for these is 32, so that guard was
+		// always false and the whole handler was unreachable: the enable
+		// flag never got set, so Compressor's Bypass stayed permanently
+		// engaged no matter what the UI sent. Confirmed via logcat
+		// ("Failed to apply dsp_compander" on every toggle) before fixing.
+		if (cep->psize == 4 && cep->vsize == 32)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 10100) // Gate: enabled, open_db, close_db, attack, release, hold, reduct
 			{
 				float *p = (float *)cep;
 				int en = (int)roundf(p[5]);
@@ -617,6 +660,11 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 			int32_t cmd = ((int32_t *)cep)[3];
 			if (cmd == 1500)
 			{
+				// Legacy 3-float call shape, kept for compatibility with any
+				// caller still sending threshold/release/postgain only —
+				// attack/knee default to the same values JLimiterSetCoefficients
+				// always hardcoded (5ms/no-knee). The real UI now sends the
+				// 5-float shape below (vsize == 20) instead.
 				double limThreshold = (double)((float*)cep)[4];
 				double limRelease = (double)((float*)cep)[5];
 				double postgain = (double)((float*)cep)[6];
@@ -633,6 +681,41 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 #ifdef DEBUG
 				LOGE("limThreshold: %f, limRelease: %f, postgain: %f", limThreshold, limRelease, postgain);
 #endif
+				*replyData = 0;
+				return 0;
+			}
+		}
+		if (cep->psize == 4 && cep->vsize == 20)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1500) // Limiter: threshold, attack, release, knee, postgain
+			{
+				float *p = (float *)cep;
+				double limThreshold = (double)p[4];
+				double limAttack = (double)p[5];
+				double limRelease = (double)p[6];
+				double limKnee = (double)p[7];
+				double postgain = (double)p[8];
+				if (limThreshold > -0.09)
+					limThreshold = -0.09;
+				if (limAttack < 0.25)
+					limAttack = 0.25;
+				if (limRelease < 0.25)
+					limRelease = 0.25;
+				if (limKnee < 0.0)
+					limKnee = 0.0;
+				if (limKnee > 1.0)
+					limKnee = 1.0;
+				if (postgain > 15.0)
+					postgain = 15.0;
+				if (postgain < -15.0)
+					postgain = -15.0;
+				// Calls the real LSP limiter directly, bypassing the
+				// JLimiterSetCoefficients shim (which hardcodes attack=5ms,
+				// knee=1.0/no-knee) — this is the path that actually exposes
+				// attack/knee as real tunables from the UI.
+				lsp_limiter_configure(dspmain->jdsp.limiter_handle, (float)limThreshold, (float)limAttack, (float)limRelease, (float)limKnee);
+				JamesDSPSetPostGain(&dspmain->jdsp, postgain);
 				*replyData = 0;
 				return 0;
 			}

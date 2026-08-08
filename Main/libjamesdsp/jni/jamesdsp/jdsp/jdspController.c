@@ -502,9 +502,17 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 }
 void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 {
-	g_chain_jdsp = jdsp;
-	chain_init_static();
-	chain_process(jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
+	// This is jdsp->processInternal — the function every real playback path
+	// (all sample-format variants below) actually calls per audio block.
+	// It used to duplicate just the chain_process() call from
+	// JamesDSPProcess() below and stop there, silently skipping that
+	// function's tail: the postGain multiply, the LSP output limiter, and
+	// the Lua audio-reactivity tick. JamesDSPProcess() itself was never
+	// called from anywhere — dead code — so the limiter/postGain/Lua tick
+	// never ran on real audio regardless of any UI/command wiring. Delegate
+	// to the complete function instead of re-duplicating a stripped copy of
+	// it.
+	JamesDSPProcess(jdsp, n);
 }
 void sample_ratio(unsigned long long numerator, unsigned long long denominator, unsigned long long *num, unsigned long long *denom)
 {
