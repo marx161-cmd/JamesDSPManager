@@ -40,6 +40,93 @@ typedef struct
 	int32_t cmd;
 	int32_t data;
 } reply1x4_1x4_t;
+
+// Lua command dispatch — exposed to lua_bridge via set_command_handler().
+// Handles module enable toggles (1201-1213) and param set commands in a
+// simplified int+float format that skips the AIDL wire format.
+static EffectDSPMain *g_lua_cmd_dspmain = NULL;
+
+static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
+    if (!g_lua_cmd_dspmain) return -1;
+    EffectDSPMain *d = g_lua_cmd_dspmain;
+
+    // Module enable toggles (1201-1213): params[0] = 0/1
+    if (cmd >= 1201 && cmd <= 1213 && nparams >= 1) {
+        int en = (int)params[0];
+        switch (cmd) {
+        case 1201: // bassboost
+            if (en) BassBoostEnable(&d->jdsp);
+            else BassBoostDisable(&d->jdsp);
+            return 0;
+        case 1202: // equalizer
+            if (en) MultimodalEqualizerEnable(&d->jdsp, 1);
+            else MultimodalEqualizerDisable(&d->jdsp);
+            return 0;
+        case 1203: // reverb
+            if (en) ReverbEnable(&d->jdsp);
+            else ReverbDisable(&d->jdsp);
+            return 0;
+        case 1204: // stereo
+            if (en) StereoEnhancementEnable(&d->jdsp);
+            else StereoEnhancementDisable(&d->jdsp);
+            return 0;
+        case 1205: // convolver
+            if (en) Convolver1DEnable(&d->jdsp);
+            else Convolver1DDisable(&d->jdsp);
+            return 0;
+        case 1207: // autogain
+            d->jdsp.autogainEnabled = en;
+            return 0;
+        case 1208: // crossfeed
+            if (en) CrossfeedEnable(&d->jdsp, 1);
+            else CrossfeedDisable(&d->jdsp);
+            return 0;
+        case 1210: // arbitrary response eq
+            if (en) ArbitraryResponseEqualizerEnable(&d->jdsp, 1);
+            else ArbitraryResponseEqualizerDisable(&d->jdsp);
+            return 0;
+        case 1212: // ddc
+            if (en) DDCEnable(&d->jdsp, 1);
+            else DDCDisable(&d->jdsp);
+            return 0;
+        case 1213: // liveprog
+            if (en) LiveProgEnable(&d->jdsp);
+            else LiveProgDisable(&d->jdsp);
+            return 0;
+        default: return -1;
+        }
+    }
+
+    // Gate/Compressor param bundles (10100/10101): params = {en, p1, p2, p3, p4, p5, p6}
+    if (cmd == 10100 && nparams >= 7) {
+        d->jdsp.gateEnabled = (int)params[0];
+        if (d->jdsp.gateEnabled)
+            lsp_gate_configure(d->jdsp.gate_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
+        return 0;
+    }
+    if (cmd == 10101 && nparams >= 7) {
+        d->jdsp.mbDynEnabled = (int)params[0];
+        if (d->jdsp.mbDynEnabled)
+            lsp_comp_configure(d->jdsp.compressor_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
+        return 0;
+    }
+
+    // Tube drive (150): params[0] = drive (0.0 = off)
+    if (cmd == 150 && nparams >= 1) {
+        VacuumTubeSetGain(&d->jdsp, params[0]);
+        return 0;
+    }
+
+    // Limiter (1500): params = {threshold, attack, release, knee, postgain}
+    if (cmd == 1500 && nparams >= 5) {
+        lsp_limiter_configure(d->jdsp.limiter_handle, params[0], params[1], params[2], params[3]);
+        d->jdsp.postGain = params[4];
+        return 0;
+    }
+
+    return -1; // unknown command
+}
+
 void EffectDSPMainConstructor(EffectDSPMain *dspmain)
 {
 	dspmain->initializeForFirst = 0;
@@ -937,6 +1024,8 @@ int32_t EffectCreate(const effect_uuid_t *uuid, int32_t sessionId, int32_t ioId,
 	LOGI("JamesDSP: Creating effect with %d sessionId", sessionId);
 #endif
 	EffectDSPMainConstructor(&e->effect);
+	g_lua_cmd_dspmain = &e->effect;
+	lua_bridge_set_command_handler(lua_cmd_dispatch);
 	e->descriptor = &jamesdsp_descriptor;
 	*pEffect = (effect_handle_t)e;
 #ifdef DEBUG

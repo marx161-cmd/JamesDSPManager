@@ -381,26 +381,36 @@ void JLimiterSetCoefficients(JamesDSPLib *d, double threshold_db, double release
 
 static JamesDSPLib *g_chain_jdsp = NULL;
 
-static void w_tube(float *L, float *R, unsigned n)      { (void)L; (void)R; VacuumTubeProcess(g_chain_jdsp, n); }
-static void w_eq(float *L, float *R, unsigned n)         { (void)L; (void)R; MultimodalEqualizerProcess(g_chain_jdsp, n); }
-static void w_arb_eq(float *L, float *R, unsigned n)     { (void)L; (void)R; ArbitraryResponseEqualizerProcess(g_chain_jdsp, n); }
-static void w_conv(float *L, float *R, unsigned n)       { (void)L; (void)R; if (g_chain_jdsp->conv.process) g_chain_jdsp->conv.process(g_chain_jdsp, n); }
-static void w_ddc(float *L, float *R, unsigned n)        { (void)L; (void)R; DDCProcess(g_chain_jdsp, n); }
-static void w_liveprog(float *L, float *R, unsigned n)   { (void)L; (void)R; LiveProgProcess(g_chain_jdsp, n); }
-static void w_crossfeed(float *L, float *R, unsigned n)  { (void)L; (void)R; CrossfeedProcess(g_chain_jdsp, n); }
-static void w_stereo(float *L, float *R, unsigned n)     { (void)L; (void)R; StereoEnhancementProcess(g_chain_jdsp, n); }
-static void w_reverb(float *L, float *R, unsigned n)     { (void)L; (void)R; ReverbProcess(g_chain_jdsp, n); }
+static void w_tube(float *L, float *R, unsigned n)      { lua_bridge_hook_fire("tube", L, R, (int)n); VacuumTubeProcess(g_chain_jdsp, n); }
+static void w_eq(float *L, float *R, unsigned n)         { lua_bridge_hook_fire("eq", L, R, (int)n); MultimodalEqualizerProcess(g_chain_jdsp, n); }
+static void w_arb_eq(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("arb_eq", L, R, (int)n); ArbitraryResponseEqualizerProcess(g_chain_jdsp, n); }
+static void w_conv(float *L, float *R, unsigned n)       { lua_bridge_hook_fire("convolver", L, R, (int)n); if (g_chain_jdsp->conv.process) g_chain_jdsp->conv.process(g_chain_jdsp, n); }
+static void w_ddc(float *L, float *R, unsigned n)        { lua_bridge_hook_fire("ddc", L, R, (int)n); DDCProcess(g_chain_jdsp, n); }
+static void w_liveprog(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("liveprog", L, R, (int)n); LiveProgProcess(g_chain_jdsp, n); }
+static void w_crossfeed(float *L, float *R, unsigned n)  { lua_bridge_hook_fire("crossfeed", L, R, (int)n); CrossfeedProcess(g_chain_jdsp, n); }
+static void w_stereo(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("stereo", L, R, (int)n); StereoEnhancementProcess(g_chain_jdsp, n); }
+static void w_reverb(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("reverb", L, R, (int)n); ReverbProcess(g_chain_jdsp, n); }
+// Lua per-block audio tap — self-gating: returns immediately if no script
+// defines process_block() or process(). Registered after reverb (last in chain
+// before output) for post-all-modules monitoring.
+static void w_lua_process(float *L, float *R, unsigned n) {
+	if (lua_bridge_process_block(L, R, (int)n)) return;
+	// Fallback: per-sample process() tap for FIFO monitoring scripts
+	for (unsigned i = 0; i < n; i++)
+		lua_bridge_process_sample(L[i], R[i]);
+}
 // Legacy Dynamic Bass Boost (dbb.c) — restored as an opt-in module, off by
 // default. Algorithm was never deleted, only unwired; kept for people who
 // prefer it over relying on EQ for bass shaping.
-static void w_bassboost(float *L, float *R, unsigned n)  { (void)L; (void)R; BassBoostProcess(g_chain_jdsp, n); }
+static void w_bassboost(float *L, float *R, unsigned n)  { lua_bridge_hook_fire("bassboost", L, R, (int)n); BassBoostProcess(g_chain_jdsp, n); }
 // Compressor/Gate now own a real Bypass crossfade internally (lsp_wrap.cpp)
 // instead of being hard-skipped by chain_process() when disabled — that
 // hard skip made enabling/disabling either from the UI an instant step in
 // gain, audible as a click. They're always called now; each is a near-zero
 // -cost no-op once its own Bypass has settled fully disabled.
-static void w_mb_dyn(float *L, float *R, unsigned n)     { lsp_comp_process(g_chain_jdsp->compressor_handle, L, R, n, g_chain_jdsp->mbDynEnabled); }
-static void w_gate_lsp(float *L, float *R, unsigned n)   { lsp_gate_process(g_chain_jdsp->gate_handle, L, R, n, g_chain_jdsp->gateEnabled); }
+static void w_mb_dyn(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("compressor", L, R, (int)n); lsp_comp_process(g_chain_jdsp->compressor_handle, L, R, n, g_chain_jdsp->mbDynEnabled); }
+static void w_gate_lsp(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("gate", L, R, (int)n); lsp_gate_process(g_chain_jdsp->gate_handle, L, R, n, g_chain_jdsp->gateEnabled); }
+static void w_autogain(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("autogain", L, R, (int)n); autogain_process(L, R, n); }
 // No chain wrapper for the limiter: it's applied once, explicitly, at the
 // end of JamesDSPProcess() after postGain — that's the real "last line of
 // defense" position. It used to ALSO run mid-chain via chain_register()
@@ -414,7 +424,7 @@ static void chain_init_static(void) {
 	if (g_chain_initialized) return;
 	g_chain_initialized = 1;
 
-	chain_register("autogain",   autogain_process,   &g_chain_jdsp->autogainEnabled);
+	chain_register("autogain",   w_autogain,         &g_chain_jdsp->autogainEnabled);
 	// gate/compressor: NULL toggle here is deliberate — chain_process()
 	// must always call them so their internal Bypass crossfade can run
 	// during the ~5ms enable/disable transition. They self-gate via
@@ -432,11 +442,12 @@ static void chain_init_static(void) {
 	chain_register("crossfeed",  w_crossfeed,        &g_chain_jdsp->crossfeedEnabled);
 	chain_register("stereo",     w_stereo,           &g_chain_jdsp->sterEnhEnabled);
 	chain_register("reverb",     w_reverb,           &g_chain_jdsp->reverbEnabled);
+	chain_register("lua",        w_lua_process,      NULL);
 
 	// Order matches stock's original chain position: bass boost right after
 	// the compressor, before EQ.
-	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-	chain_set_order(default_order, 13);
+	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+	chain_set_order(default_order, 14);
 }
 
 // Process
@@ -480,13 +491,14 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 		lua_bridge_set_sample_rate((int)jdsp->fs);
 		lua_bridge_set_postgain(jdsp->postGain);
 		// Order must match g_module_names[] in lua_bridge.c
-		int moduleStates[12] = {
+		int moduleStates[13] = {
 			jdsp->gateEnabled, jdsp->mbDynEnabled, jdsp->autogainEnabled,
 			jdsp->reverbEnabled, jdsp->sterEnhEnabled, jdsp->tubeEnabled,
 			jdsp->convolverEnabled, jdsp->equalizerEnabled, jdsp->crossfeedEnabled,
-			jdsp->ddcEnabled, jdsp->arbitraryMagEnabled, jdsp->liveprogEnabled
+			jdsp->ddcEnabled, jdsp->arbitraryMagEnabled, jdsp->liveprogEnabled,
+			1 // lua module always runs (self-gating)
 		};
-		lua_bridge_set_module_states(moduleStates, 12);
+		lua_bridge_set_module_states(moduleStates, 13);
 		lua_bridge_tick(NULL, (int)n);
 		jdsp->luaTickCounter = jdsp->luaTickInterval;
 	} else {
