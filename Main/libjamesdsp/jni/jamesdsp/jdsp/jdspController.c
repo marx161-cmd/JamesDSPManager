@@ -1238,6 +1238,27 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	__android_log_print(ANDROID_LOG_INFO, TAG, "Printing benchmark data end");
 #endif
 	lua_bridge_init();
+	// Auto-load a user script from a fixed path if present, mirroring mpv's
+	// scripts/-folder auto-load convenience — no UI/AIDL round-trip needed.
+	// Only one script slot exists (lua_bridge_load_script replaces globals
+	// wholesale), so this is a single fixed file, not a directory scan.
+	if (!jdsp->luaScript || !jdsp->luaScript[0]) {
+		FILE *lsf = fopen("/data/data/com.termux.jdsp/files/scripts/reactive.lua", "rb");
+		if (lsf) {
+			fseek(lsf, 0, SEEK_END);
+			long lsz = ftell(lsf);
+			fseek(lsf, 0, SEEK_SET);
+			if (lsz > 0) {
+				char *lbuf = (char *)malloc((size_t)lsz + 1);
+				if (lbuf) {
+					size_t lrd = fread(lbuf, 1, (size_t)lsz, lsf);
+					lbuf[lrd] = '\0';
+					jdsp->luaScript = lbuf;
+				}
+			}
+			fclose(lsf);
+		}
+	}
 	if (jdsp->luaScript && jdsp->luaScript[0])
 		lua_bridge_load_script(jdsp->luaScript);
 	jdsp->compressor_handle = lsp_comp_create(sample_rate);
