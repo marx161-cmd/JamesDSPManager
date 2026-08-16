@@ -384,9 +384,14 @@ static JamesDSPLib *g_chain_jdsp = NULL;
 static void w_tube(float *L, float *R, unsigned n)      { lua_bridge_hook_fire("tube", L, R, (int)n); VacuumTubeProcess(g_chain_jdsp, n); }
 static void w_eq(float *L, float *R, unsigned n)         { lua_bridge_hook_fire("eq", L, R, (int)n); MultimodalEqualizerProcess(g_chain_jdsp, n); }
 static void w_arb_eq(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("arb_eq", L, R, (int)n); ArbitraryResponseEqualizerProcess(g_chain_jdsp, n); }
-static void w_conv(float *L, float *R, unsigned n)       { lua_bridge_hook_fire("convolver", L, R, (int)n); if (g_chain_jdsp->conv.process) g_chain_jdsp->conv.process(g_chain_jdsp, n); }
-static void w_ddc(float *L, float *R, unsigned n)        { lua_bridge_hook_fire("ddc", L, R, (int)n); DDCProcess(g_chain_jdsp, n); }
-static void w_liveprog(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("liveprog", L, R, (int)n); LiveProgProcess(g_chain_jdsp, n); }
+// Locked: these three read state (conv1d2x2_S_S, DDC filter bank, EEL2 VM)
+// that the AIDL/JNI loaders (Convolver1DLoadImpulseResponse, DDCStringParser,
+// LiveProgStringParser) free and rebuild under jdsp_lock on the binder
+// thread. Without this bracket, loading a new IR/VDC/liveprog file during
+// playback races the audio thread and can dereference freed memory.
+static void w_conv(float *L, float *R, unsigned n)       { lua_bridge_hook_fire("convolver", L, R, (int)n); jdsp_lock(g_chain_jdsp); if (g_chain_jdsp->conv.process) g_chain_jdsp->conv.process(g_chain_jdsp, n); jdsp_unlock(g_chain_jdsp); }
+static void w_ddc(float *L, float *R, unsigned n)        { lua_bridge_hook_fire("ddc", L, R, (int)n); jdsp_lock(g_chain_jdsp); DDCProcess(g_chain_jdsp, n); jdsp_unlock(g_chain_jdsp); }
+static void w_liveprog(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("liveprog", L, R, (int)n); jdsp_lock(g_chain_jdsp); LiveProgProcess(g_chain_jdsp, n); jdsp_unlock(g_chain_jdsp); }
 static void w_crossfeed(float *L, float *R, unsigned n)  { lua_bridge_hook_fire("crossfeed", L, R, (int)n); CrossfeedProcess(g_chain_jdsp, n); }
 static void w_stereo(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("stereo", L, R, (int)n); StereoEnhancementProcess(g_chain_jdsp, n); }
 static void w_reverb(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("reverb", L, R, (int)n); ReverbProcess(g_chain_jdsp, n); }
@@ -419,10 +424,15 @@ static void w_autogain(float *L, float *R, unsigned n)   { lua_bridge_hook_fire(
 // lookahead delay line every callback. Removed from the chain; the
 // explicit call at the end of JamesDSPProcess() is now the only call.
 
-static int g_chain_initialized = 0;
 static void chain_init_static(void) {
-	if (g_chain_initialized) return;
-	g_chain_initialized = 1;
+	// Re-registered on every JamesDSPProcess() call (cheap: 14 struct writes)
+	// rather than once per process lifetime. The old one-shot gate captured
+	// &g_chain_jdsp->*Enabled addresses from whichever JamesDSPLib instance
+	// was current on the FIRST call and never updated them — on a later
+	// EffectRelease/EffectCreate cycle those addresses pointed into a freed
+	// struct (UAF) and, with multiple concurrent instances, toggles from one
+	// instance silently controlled another's chain.
+	chain_reset();
 
 	chain_register("autogain",   w_autogain,         &g_chain_jdsp->autogainEnabled);
 	// gate/compressor: NULL toggle here is deliberate — chain_process()
@@ -525,6 +535,15 @@ void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 	// to the complete function instead of re-duplicating a stripped copy of
 	// it.
 	JamesDSPProcess(jdsp, n);
+
+	// Restored from the original: once a benchmark run completes (flag set
+	// by JamesDSP_Load_benchmark / JamesDSP_Save_benchmark), rebuild the
+	// convolver with the measured-optimal partition sizes and stop taking
+	// this check on every future block.
+	if (benchmarkCompletionFlag == 1) {
+		JamesDSPRefreshConvolutions(jdsp, 0);
+		jdsp->processInternal = JamesDSPProcess;
+	}
 }
 void sample_ratio(unsigned long long numerator, unsigned long long denominator, unsigned long long *num, unsigned long long *denom)
 {
