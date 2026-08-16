@@ -243,9 +243,15 @@ void JamesDSPGlobalMemoryDeallocation()
 // Form II Transposed. Runs on a downmix COPY inside JamesDSPProcess, never
 // writes back into tmpBuffer, so it can never alter real playback the way
 // inserting a filter into a real signal graph (e.g. mpv's `af`) would.
-// Band 0 = bass. Coeffs only recomputed when fs changes (cheap, 30Hz tick).
-#define LUA_BAND_METER_BASS_HZ (90.0)
-#define LUA_BAND_METER_BASS_Q  (0.9)
+// Index 0 = bass, increasing toward treble. Center frequencies are
+// log-spaced to cover the full audible range at a fixed count; coeffs are
+// only recomputed when fs changes (cheap, 30Hz tick).
+static const double g_bandMeterCenterHz[LUA_BAND_METER_COUNT] = {
+    90.0, 250.0, 700.0, 2000.0, 6000.0
+};
+static const double g_bandMeterQ[LUA_BAND_METER_COUNT] = {
+    0.9, 1.0, 1.1, 1.2, 1.2
+};
 static float g_bandMeterB0[LUA_BAND_METER_COUNT], g_bandMeterB2[LUA_BAND_METER_COUNT];
 static float g_bandMeterA1[LUA_BAND_METER_COUNT], g_bandMeterA2[LUA_BAND_METER_COUNT];
 static void bandmeter_update_coeffs(double fs, double centerHz, double Q, int idx)
@@ -473,29 +479,31 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	// Lua scripting tick — 30Hz
 	if (jdsp->luaTickCounter <= 0) {
 		if (jdsp->bandMeterCoeffFs != jdsp->fs) {
-			bandmeter_update_coeffs(jdsp->fs, LUA_BAND_METER_BASS_HZ, LUA_BAND_METER_BASS_Q, 0);
+			for (int b = 0; b < LUA_BAND_METER_COUNT; b++)
+				bandmeter_update_coeffs(jdsp->fs, g_bandMeterCenterHz[b], g_bandMeterQ[b], b);
 			jdsp->bandMeterCoeffFs = jdsp->fs;
 		}
-		float b0 = g_bandMeterB0[0], b2 = g_bandMeterB2[0];
-		float a1 = g_bandMeterA1[0], a2 = g_bandMeterA2[0];
-		float w1 = jdsp->bandMeterState1[0], w2 = jdsp->bandMeterState2[0];
 		float rms = 0.0f;
-		double bassSum = 0.0;
+		double bandSums[LUA_BAND_METER_COUNT];
+		for (int b = 0; b < LUA_BAND_METER_COUNT; b++) bandSums[b] = 0.0;
 		for (size_t i = 0; i < n; i++) {
 			// Full-spectrum + band taps both read the post-chain mix
 			// (a value), never write it back — analysis only.
 			float mono = (jdsp->tmpBuffer[0][i] + jdsp->tmpBuffer[1][i]) * 0.5f;
 			rms += mono * mono;
-			float bandY = b0 * mono + w1;
-			w1 = -a1 * bandY + w2; // b1 == 0 for this bandpass form
-			w2 = b2 * mono - a2 * bandY;
-			bassSum += (double)bandY * (double)bandY;
+			for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
+				float s1 = jdsp->bandMeterState1[b];
+				float s2 = jdsp->bandMeterState2[b];
+				float bandY = g_bandMeterB0[b] * mono + s1;
+				jdsp->bandMeterState1[b] = -g_bandMeterA1[b] * bandY + s2; // b1 == 0
+				jdsp->bandMeterState2[b] = g_bandMeterB2[b] * mono - g_bandMeterA2[b] * bandY;
+				bandSums[b] += (double)bandY * (double)bandY;
+			}
 		}
-		jdsp->bandMeterState1[0] = w1;
-		jdsp->bandMeterState2[0] = w2;
 		rms = sqrtf(rms / (float)n);
 		float bandEnergies[LUA_BAND_METER_COUNT];
-		bandEnergies[0] = sqrtf((float)(bassSum / (double)n));
+		for (int b = 0; b < LUA_BAND_METER_COUNT; b++)
+			bandEnergies[b] = sqrtf((float)(bandSums[b] / (double)n));
 		lua_bridge_set_audio_level(rms);
 		lua_bridge_set_bands(bandEnergies, LUA_BAND_METER_COUNT);
 		lua_bridge_set_sample_rate((int)jdsp->fs);
@@ -509,6 +517,44 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 			1 // lua module always runs (self-gating)
 		};
 		lua_bridge_set_module_states(moduleStates, 13);
+
+		// Telemetry properties (mpv-style property tree). These are live
+		// values refreshed each tick; the limiter runs *after* this tick, so
+		// its reduction is one block (~5ms) stale — negligible at 30Hz.
+		lua_bridge_set_property_number("gate.gain_reduction_db",
+			(double)lsp_gate_get_reduction_db(jdsp->gate_handle));
+		lua_bridge_set_property_number("gate.closed",
+			lsp_gate_is_closed(jdsp->gate_handle) ? 1.0 : 0.0);
+		lua_bridge_set_property_number("compressor.gain_reduction_db",
+			(double)lsp_comp_get_reduction_db(jdsp->compressor_handle));
+		lua_bridge_set_property_number("limiter.gain_reduction_db",
+			(double)lsp_limiter_get_reduction_db(jdsp->limiter_handle));
+		lua_bridge_set_property_number("limiter.limiting",
+			lsp_limiter_is_limiting(jdsp->limiter_handle) ? 1.0 : 0.0);
+		lua_bridge_set_property_number("autogain.current_gain_db",
+			(double)autogain_get_gain_db());
+		lua_bridge_set_property_number("convolver.active",
+			(jdsp->convolverEnabled && jdsp->conv.process != NULL) ? 1.0 : 0.0);
+		lua_bridge_set_property_number("convolver.impulse_length",
+			(double)jdsp->impulseResponseStorage.impulseLengthActual);
+		lua_bridge_set_property_number("stereo.mix",
+			(double)jdsp->sterEnh.mix);
+		lua_bridge_set_property_number("tube.drive_db",
+			mag2dB(jdsp->tube.pregain));
+		lua_bridge_set_property_number("crossfeed.mode",
+			(double)jdsp->advXF.mode);
+		lua_bridge_set_property_number("bassboost.boost_db",
+			(double)jdsp->dbb.boostdB);
+		// EQ per-band gain (dB). The 15 user band gains already sit in
+		// jdsp->mEQ.gain[1..NUMPTS] (see MultimodalEQ — gaindB is memcpy'd
+		// into gain[1..NUMPTS]; gain[0]/gain[NUMPTS+1] are edge pads). Expose
+		// eq.gain_0..eq.gain_14 (25 Hz .. 16 kHz, low to high).
+		for (int b = 0; b < NUMPTS; b++) {
+			char name[32];
+			snprintf(name, sizeof(name), "eq.gain_%d", b);
+			lua_bridge_set_property_number(name, jdsp->mEQ.gain[b + 1]);
+		}
+
 		lua_bridge_tick(NULL, (int)n);
 		jdsp->luaTickCounter = jdsp->luaTickInterval;
 	} else {

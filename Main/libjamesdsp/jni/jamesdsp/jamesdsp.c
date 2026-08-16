@@ -74,6 +74,10 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
             if (en) Convolver1DEnable(&d->jdsp);
             else Convolver1DDisable(&d->jdsp);
             return 0;
+        case 1206: // tube (analogue modelling)
+            if (en) VacuumTubeEnable(&d->jdsp);
+            else VacuumTubeDisable(&d->jdsp);
+            return 0;
         case 1207: // autogain
             d->jdsp.autogainEnabled = en;
             return 0;
@@ -97,16 +101,21 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
         }
     }
 
-    // Gate/Compressor param bundles (10100/10101): params = {en, p1, p2, p3, p4, p5, p6}
-    if (cmd == 10100 && nparams >= 7) {
+    // Gate/Compressor (10100/10101). nparams==1 is enable-only: flip the flag
+    // without touching parameters — the LSP wrapper's Bypass crossfade does
+    // the actual on/off each block, and re-sending a fixed param preset here
+    // would stomp the user's configured settings. nparams>=7 additionally
+    // reconfigures the full {en, p1..p6} bundle for scripts that want to set
+    // parameters explicitly.
+    if (cmd == 10100 && nparams >= 1) {
         d->jdsp.gateEnabled = (int)params[0];
-        if (d->jdsp.gateEnabled)
+        if (nparams >= 7 && d->jdsp.gateEnabled)
             lsp_gate_configure(d->jdsp.gate_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
         return 0;
     }
-    if (cmd == 10101 && nparams >= 7) {
+    if (cmd == 10101 && nparams >= 1) {
         d->jdsp.mbDynEnabled = (int)params[0];
-        if (d->jdsp.mbDynEnabled)
+        if (nparams >= 7 && d->jdsp.mbDynEnabled)
             lsp_comp_configure(d->jdsp.compressor_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
         return 0;
     }
@@ -127,6 +136,112 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
     return -1; // unknown command
 }
 
+// ============================================================================
+// Lua property accessors — per-parameter control (write side)
+// ============================================================================
+// Registered via lua_bridge_register_property() in EffectDSPMainConstructor.
+// The property ABI is context-free (double get(void) / int set(double)), so
+// these close over the file-static g_lua_cmd_dspmain set on the AIDL path.
+// Each setter reads the module's current config, changes exactly one
+// parameter, and re-applies the full bundle — never stomps the others.
+
+static void comp_config(float out[6]) {
+    if (g_lua_cmd_dspmain)
+        lsp_comp_get_config(g_lua_cmd_dspmain->jdsp.compressor_handle,
+                            &out[0], &out[1], &out[2], &out[3], &out[4], &out[5]);
+    else
+        for (int i = 0; i < 6; i++) out[i] = 0.0f;
+}
+static void comp_apply(const float c[6]) {
+    if (g_lua_cmd_dspmain)
+        lsp_comp_configure(g_lua_cmd_dspmain->jdsp.compressor_handle,
+                           c[0], c[1], c[2], c[3], c[4], c[5]);
+}
+
+static void gate_config(float out[6]) {
+    if (g_lua_cmd_dspmain)
+        lsp_gate_get_config(g_lua_cmd_dspmain->jdsp.gate_handle,
+                            &out[0], &out[1], &out[2], &out[3], &out[4], &out[5]);
+    else
+        for (int i = 0; i < 6; i++) out[i] = 0.0f;
+}
+static void gate_apply(const float c[6]) {
+    if (g_lua_cmd_dspmain)
+        lsp_gate_configure(g_lua_cmd_dspmain->jdsp.gate_handle,
+                           c[0], c[1], c[2], c[3], c[4], c[5]);
+}
+
+static void lim_config(float out[4]) {
+    if (g_lua_cmd_dspmain)
+        lsp_limiter_get_config(g_lua_cmd_dspmain->jdsp.limiter_handle,
+                               &out[0], &out[1], &out[2], &out[3]);
+    else
+        for (int i = 0; i < 4; i++) out[i] = 0.0f;
+}
+static void lim_apply(const float c[4]) {
+    if (g_lua_cmd_dspmain)
+        lsp_limiter_configure(g_lua_cmd_dspmain->jdsp.limiter_handle,
+                              c[0], c[1], c[2], c[3]);
+}
+
+#define JDSP_DYN_PROP(TAG, LOAD, APPLY, IDX, NC)                 \
+    static double jdsp_prop_get_##TAG(void) {                    \
+        float c[NC]; LOAD(c); return (double)c[IDX];             \
+    }                                                            \
+    static int jdsp_prop_set_##TAG(double v) {                   \
+        float c[NC]; LOAD(c); c[IDX] = (float)v; APPLY(c);       \
+        return 0;                                                \
+    }
+
+JDSP_DYN_PROP(comp_threshold, comp_config, comp_apply, 0, 6)
+JDSP_DYN_PROP(comp_ratio,     comp_config, comp_apply, 1, 6)
+JDSP_DYN_PROP(comp_knee,      comp_config, comp_apply, 2, 6)
+JDSP_DYN_PROP(comp_attack,    comp_config, comp_apply, 3, 6)
+JDSP_DYN_PROP(comp_release,   comp_config, comp_apply, 4, 6)
+JDSP_DYN_PROP(comp_hold,      comp_config, comp_apply, 5, 6)
+
+JDSP_DYN_PROP(gate_open,      gate_config, gate_apply, 0, 6)
+JDSP_DYN_PROP(gate_close,     gate_config, gate_apply, 1, 6)
+JDSP_DYN_PROP(gate_attack,    gate_config, gate_apply, 2, 6)
+JDSP_DYN_PROP(gate_release,   gate_config, gate_apply, 3, 6)
+JDSP_DYN_PROP(gate_hold,      gate_config, gate_apply, 4, 6)
+JDSP_DYN_PROP(gate_reduction, gate_config, gate_apply, 5, 6)
+
+JDSP_DYN_PROP(lim_threshold,  lim_config, lim_apply, 0, 4)
+JDSP_DYN_PROP(lim_attack,     lim_config, lim_apply, 1, 4)
+JDSP_DYN_PROP(lim_release,    lim_config, lim_apply, 2, 4)
+JDSP_DYN_PROP(lim_knee,       lim_config, lim_apply, 3, 4)
+
+static double jdsp_prop_get_tube_drive(void) {
+    if (!g_lua_cmd_dspmain) return 0.0;
+    return mag2dB(g_lua_cmd_dspmain->jdsp.tube.pregain);
+}
+static int jdsp_prop_set_tube_drive(double v) {
+    if (!g_lua_cmd_dspmain) return -1;
+    VacuumTubeSetGain(&g_lua_cmd_dspmain->jdsp, v);
+    return 0;
+}
+
+static void register_lua_properties(void) {
+    lua_bridge_register_property("compressor.threshold_db", jdsp_prop_get_comp_threshold, jdsp_prop_set_comp_threshold);
+    lua_bridge_register_property("compressor.ratio",        jdsp_prop_get_comp_ratio,     jdsp_prop_set_comp_ratio);
+    lua_bridge_register_property("compressor.knee_db",      jdsp_prop_get_comp_knee,      jdsp_prop_set_comp_knee);
+    lua_bridge_register_property("compressor.attack_ms",    jdsp_prop_get_comp_attack,    jdsp_prop_set_comp_attack);
+    lua_bridge_register_property("compressor.release_ms",   jdsp_prop_get_comp_release,   jdsp_prop_set_comp_release);
+    lua_bridge_register_property("compressor.hold_ms",      jdsp_prop_get_comp_hold,      jdsp_prop_set_comp_hold);
+    lua_bridge_register_property("gate.open_db",            jdsp_prop_get_gate_open,      jdsp_prop_set_gate_open);
+    lua_bridge_register_property("gate.close_db",           jdsp_prop_get_gate_close,     jdsp_prop_set_gate_close);
+    lua_bridge_register_property("gate.attack_ms",          jdsp_prop_get_gate_attack,    jdsp_prop_set_gate_attack);
+    lua_bridge_register_property("gate.release_ms",         jdsp_prop_get_gate_release,   jdsp_prop_set_gate_release);
+    lua_bridge_register_property("gate.hold_ms",            jdsp_prop_get_gate_hold,      jdsp_prop_set_gate_hold);
+    lua_bridge_register_property("gate.reduction_db",       jdsp_prop_get_gate_reduction, jdsp_prop_set_gate_reduction);
+    lua_bridge_register_property("limiter.threshold_db",    jdsp_prop_get_lim_threshold,  jdsp_prop_set_lim_threshold);
+    lua_bridge_register_property("limiter.attack_ms",       jdsp_prop_get_lim_attack,     jdsp_prop_set_lim_attack);
+    lua_bridge_register_property("limiter.release_ms",      jdsp_prop_get_lim_release,    jdsp_prop_set_lim_release);
+    lua_bridge_register_property("limiter.knee_db",         jdsp_prop_get_lim_knee,       jdsp_prop_set_lim_knee);
+    lua_bridge_register_property("tube.drive_db",           jdsp_prop_get_tube_drive,     jdsp_prop_set_tube_drive);
+}
+
 void EffectDSPMainConstructor(EffectDSPMain *dspmain)
 {
 	dspmain->initializeForFirst = 0;
@@ -138,6 +253,15 @@ void EffectDSPMainConstructor(EffectDSPMain *dspmain)
 	dspmain->samplesInc = 0;
 	dspmain->stringIndex = 0;
 	JamesDSPInit(&dspmain->jdsp, 128, 48000.0f);
+	// Wire the Lua command handler + property target HERE, on the real AIDL
+	// path. These two lines previously lived only in EffectCreate() (the
+	// legacy audio_effect_library_t entry point), which the shipping AIDL
+	// wrapper never calls — so g_lua_cmd_dspmain stayed NULL on-device and
+	// jdsp.toggle_module()/command() were unreachable. EffectCreate() still
+	// sets them too (harmless); this is the call site that actually matters.
+	g_lua_cmd_dspmain = dspmain;
+	lua_bridge_set_command_handler(lua_cmd_dispatch);
+	register_lua_properties();
 }
 void EffectDSPMainDestructor(EffectDSPMain *dspmain)
 {

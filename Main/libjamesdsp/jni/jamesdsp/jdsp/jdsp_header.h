@@ -11,9 +11,11 @@
 #include "generalDSP/ArbFIRGen.h"
 #define MAX_BENCHMARK (10)
 // Lua band-energy meter: number of analysis-only band taps (see JamesDSPLib
-// below + lua_bridge_set_bands()). Index 0 = bass. Bump this and add a
-// coefficient case in JamesDSPProcess() to add mid/treble taps later.
-#define LUA_BAND_METER_COUNT (1)
+// below + lua_bridge_set_bands()). Index 0 = bass, increasing toward treble.
+// Band center frequencies are log-spaced and fixed in
+// jdspController.c (g_bandMeterCenterHz); bump this count only together with
+// that array.
+#define LUA_BAND_METER_COUNT (5)
 // Misc
 extern double mapVal(double x, double in_min, double in_max, double out_min, double out_max);
 extern double mag2dB(double lin);
