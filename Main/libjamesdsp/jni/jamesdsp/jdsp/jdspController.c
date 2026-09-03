@@ -419,8 +419,8 @@ static void w_bassboost(float *L, float *R, unsigned n)  { lua_bridge_hook_fire(
 // hard skip made enabling/disabling either from the UI an instant step in
 // gain, audible as a click. They're always called now; each is a near-zero
 // -cost no-op once its own Bypass has settled fully disabled.
-static void w_mb_dyn(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("compressor", L, R, (int)n); lsp_comp_process(g_chain_jdsp->compressor_handle, L, R, n, g_chain_jdsp->mbDynEnabled); }
-static void w_gate_lsp(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("gate", L, R, (int)n); lsp_gate_process(g_chain_jdsp->gate_handle, L, R, n, g_chain_jdsp->gateEnabled); }
+static void w_mb_dyn(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("compressor", L, R, (int)n); jdsp_lock(g_chain_jdsp); lsp_comp_process(g_chain_jdsp->compressor_handle, L, R, n, g_chain_jdsp->mbDynEnabled); jdsp_unlock(g_chain_jdsp); }
+static void w_gate_lsp(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("gate", L, R, (int)n); jdsp_lock(g_chain_jdsp); lsp_gate_process(g_chain_jdsp->gate_handle, L, R, n, g_chain_jdsp->gateEnabled); jdsp_unlock(g_chain_jdsp); }
 static void w_autogain(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("autogain", L, R, (int)n); autogain_process(L, R, n); }
 // No chain wrapper for the limiter: it's applied once, explicitly, at the
 // end of JamesDSPProcess() after postGain — that's the real "last line of

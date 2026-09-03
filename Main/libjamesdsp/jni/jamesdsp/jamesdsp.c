@@ -109,14 +109,20 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
     // parameters explicitly.
     if (cmd == 10100 && nparams >= 1) {
         d->jdsp.gateEnabled = (int)params[0];
-        if (nparams >= 7 && d->jdsp.gateEnabled)
+        if (nparams >= 7 && d->jdsp.gateEnabled) {
+            jdsp_lock(&d->jdsp);
             lsp_gate_configure(d->jdsp.gate_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
+            jdsp_unlock(&d->jdsp);
+        }
         return 0;
     }
     if (cmd == 10101 && nparams >= 1) {
         d->jdsp.mbDynEnabled = (int)params[0];
-        if (nparams >= 7 && d->jdsp.mbDynEnabled)
+        if (nparams >= 7 && d->jdsp.mbDynEnabled) {
+            jdsp_lock(&d->jdsp);
             lsp_comp_configure(d->jdsp.compressor_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
+            jdsp_unlock(&d->jdsp);
+        }
         return 0;
     }
 
@@ -153,9 +159,12 @@ static void comp_config(float out[6]) {
         for (int i = 0; i < 6; i++) out[i] = 0.0f;
 }
 static void comp_apply(const float c[6]) {
-    if (g_lua_cmd_dspmain)
+    if (g_lua_cmd_dspmain) {
+        jdsp_lock(&g_lua_cmd_dspmain->jdsp);
         lsp_comp_configure(g_lua_cmd_dspmain->jdsp.compressor_handle,
                            c[0], c[1], c[2], c[3], c[4], c[5]);
+        jdsp_unlock(&g_lua_cmd_dspmain->jdsp);
+    }
 }
 
 static void gate_config(float out[6]) {
@@ -166,9 +175,12 @@ static void gate_config(float out[6]) {
         for (int i = 0; i < 6; i++) out[i] = 0.0f;
 }
 static void gate_apply(const float c[6]) {
-    if (g_lua_cmd_dspmain)
+    if (g_lua_cmd_dspmain) {
+        jdsp_lock(&g_lua_cmd_dspmain->jdsp);
         lsp_gate_configure(g_lua_cmd_dspmain->jdsp.gate_handle,
                            c[0], c[1], c[2], c[3], c[4], c[5]);
+        jdsp_unlock(&g_lua_cmd_dspmain->jdsp);
+    }
 }
 
 static void lim_config(float out[4]) {
@@ -807,7 +819,11 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				float *p = (float *)cep;
 				int en = (int)roundf(p[5]);
 				dspmain->jdsp.gateEnabled = en;
-				if (en) lsp_gate_configure(dspmain->jdsp.gate_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
+				if (en) {
+					jdsp_lock(&dspmain->jdsp);
+					lsp_gate_configure(dspmain->jdsp.gate_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
+					jdsp_unlock(&dspmain->jdsp);
+				}
 				*replyData = 0;
 				return 0;
 			}
@@ -816,7 +832,11 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				float *p = (float *)cep;
 				int en = (int)roundf(p[5]);
 				dspmain->jdsp.mbDynEnabled = en;
-				if (en) lsp_comp_configure(dspmain->jdsp.compressor_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
+				if (en) {
+					jdsp_lock(&dspmain->jdsp);
+					lsp_comp_configure(dspmain->jdsp.compressor_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
+					jdsp_unlock(&dspmain->jdsp);
+				}
 				*replyData = 0;
 				return 0;
 			}
