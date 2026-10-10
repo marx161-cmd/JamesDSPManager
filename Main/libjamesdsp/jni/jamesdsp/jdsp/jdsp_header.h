@@ -21,6 +21,10 @@
 // filter bank, which derives Q = f0/bandwidth; for log-spaced bands one
 // semitone apart (ratio = 2^(1/12)) that is sqrt(ratio)/(ratio-1) ~= 17.3.
 #define CHROMA_Q (17.3)
+// bands.bin publish rate and history ring (see band_publish in
+// jdspController.c for the file layout).
+#define BAND_FRAME_HZ (60.0)
+#define BAND_RING_LEN (32)
 // Misc
 extern double mapVal(double x, double in_min, double in_max, double out_min, double out_max);
 extern double mag2dB(double lin);
@@ -607,6 +611,15 @@ typedef struct dspsys
 	float bandMeterState1[LUA_BAND_METER_COUNT];
 	float bandMeterState2[LUA_BAND_METER_COUNT];
 	double bandMeterCoeffFs;
+	// Continuous meter (2026-10-10): the taps run on EVERY sample; energy
+	// accumulates until one frame (fs / BAND_FRAME_HZ samples) has passed,
+	// then that frame is published (bands.bin latest + ring, Lua).
+	double bandAccum[LUA_BAND_METER_COUNT];
+	double bandAccumMono;
+	int bandAccumCount;
+	unsigned int bandFrameSeq;
+	float bandLatest[LUA_BAND_METER_COUNT];
+	float bandLatestRms;
 } JamesDSPLib;
 // JamesDSP controller
 extern void JamesDSPGlobalMemoryAllocation();

@@ -274,7 +274,35 @@ static void bandmeter_update_coeffs(double fs, double centerHz, double Q, int id
 // file I/O in the steady state). ShaderEditor reads the same file and uploads
 // it as a sampler2D. Setup is idempotent and fails non-fatally (logged) if the
 // path isn't writable -- the meter keeps working, only the shm bridge is off.
+//
+// Layout (little-endian), v2 since 2026-10-10:
+//   [0, 432)    108 floats: the LATEST frame (unchanged v1 layout, so old
+//               readers that take the first 432 bytes keep working)
+//   [432, 464)  BandShmHeader below
+//   [464, ...)  ring: BAND_RING_LEN frames x 108 floats; frame k (0-based)
+//               lives in slot k % BAND_RING_LEN
+// Each frame is the RMS over exactly fs / BAND_FRAME_HZ samples, no gaps.
+// Writer order: ring slot + latest + rms, then seq (release store) = number
+// of frames published. Reader: load seq (acquire), copy the frames it wants,
+// load seq again; any frame k < seq_after - BAND_RING_LEN may have been
+// overwritten during the copy and must be dropped.
+#define BAND_SHM_MAGIC (0x3242444Au) // "JDB2"
+typedef struct {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t seq;
+	uint32_t ringLen;
+	uint32_t bands;
+	float frameHz;
+	float sampleRate;
+	float rms;
+} BandShmHeader;
+#define BAND_SHM_RING_OFFSET (LUA_BAND_METER_COUNT * sizeof(float) + sizeof(BandShmHeader))
+#define BAND_SHM_SIZE (BAND_SHM_RING_OFFSET + \
+		(size_t)BAND_RING_LEN * LUA_BAND_METER_COUNT * sizeof(float))
 static float *g_bandShm = 0;
+static BandShmHeader *g_bandShmHeader = 0;
+static float *g_bandShmRing = 0;
 static void band_shm_setup(void)
 {
 	if (g_bandShm) return;
@@ -284,19 +312,109 @@ static void band_shm_setup(void)
 		__android_log_print(ANDROID_LOG_WARN, TAG, "band shm open failed: %s", path);
 		return;
 	}
-	if (ftruncate(fd, (off_t)(LUA_BAND_METER_COUNT * sizeof(float))) != 0) {
+	if (ftruncate(fd, (off_t)BAND_SHM_SIZE) != 0) {
 		__android_log_print(ANDROID_LOG_WARN, TAG, "band shm ftruncate failed");
 		close(fd);
 		return;
 	}
 	fchmod(fd, 0644);
-	void *p = mmap(0, LUA_BAND_METER_COUNT * sizeof(float), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	void *p = mmap(0, BAND_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	close(fd);
 	if (p == MAP_FAILED) {
 		__android_log_print(ANDROID_LOG_WARN, TAG, "band shm mmap failed");
 		return;
 	}
 	g_bandShm = (float *)p;
+	g_bandShmHeader = (BandShmHeader *)((char *)p +
+			LUA_BAND_METER_COUNT * sizeof(float));
+	g_bandShmRing = (float *)((char *)p + BAND_SHM_RING_OFFSET);
+	memset(p, 0, BAND_SHM_SIZE);
+	g_bandShmHeader->magic = BAND_SHM_MAGIC;
+	g_bandShmHeader->version = 2;
+	g_bandShmHeader->ringLen = BAND_RING_LEN;
+	g_bandShmHeader->bands = LUA_BAND_METER_COUNT;
+	g_bandShmHeader->frameHz = (float)BAND_FRAME_HZ;
+}
+// One finished frame -> latest values, shm latest + ring, then seq.
+static void band_publish(JamesDSPLib *jdsp)
+{
+	double inv = 1.0 / (double)jdsp->bandAccumCount;
+	for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
+		jdsp->bandLatest[b] = (float)sqrt(jdsp->bandAccum[b] * inv);
+		jdsp->bandAccum[b] = 0.0;
+	}
+	jdsp->bandLatestRms = (float)sqrt(jdsp->bandAccumMono * inv);
+	jdsp->bandAccumMono = 0.0;
+	jdsp->bandAccumCount = 0;
+	if (g_bandShm) {
+		unsigned int k = jdsp->bandFrameSeq;
+		memcpy(g_bandShmRing + (size_t)(k % BAND_RING_LEN) * LUA_BAND_METER_COUNT,
+				jdsp->bandLatest, LUA_BAND_METER_COUNT * sizeof(float));
+		memcpy(g_bandShm, jdsp->bandLatest, LUA_BAND_METER_COUNT * sizeof(float));
+		g_bandShmHeader->rms = jdsp->bandLatestRms;
+		g_bandShmHeader->sampleRate = (float)jdsp->fs;
+		__atomic_store_n(&g_bandShmHeader->seq, k + 1, __ATOMIC_RELEASE);
+	}
+	jdsp->bandFrameSeq++;
+}
+// Runs the 108 taps over every sample of the block (analysis only, reads
+// tmpBuffer, never writes it). Works in segments that end on frame
+// boundaries, so a frame is always exactly frameSamples long even when it
+// spans several blocks. Band-inner loop over local state so it vectorises.
+static void band_meter_process(JamesDSPLib *jdsp, size_t n)
+{
+	if (jdsp->bandMeterCoeffFs != jdsp->fs) {
+		for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
+			double centerHz = 27.5 * pow(2.0, (double)b / 12.0);
+			bandmeter_update_coeffs(jdsp->fs, centerHz, CHROMA_Q, b);
+			jdsp->bandMeterState1[b] = 0.0f;
+			jdsp->bandMeterState2[b] = 0.0f;
+			jdsp->bandAccum[b] = 0.0;
+		}
+		jdsp->bandAccumMono = 0.0;
+		jdsp->bandAccumCount = 0;
+		jdsp->bandMeterCoeffFs = jdsp->fs;
+	}
+	int frameSamples = (int)(jdsp->fs / BAND_FRAME_HZ + 0.5);
+	if (frameSamples < 1) frameSamples = 1;
+	float s1[LUA_BAND_METER_COUNT], s2[LUA_BAND_METER_COUNT];
+	float b0[LUA_BAND_METER_COUNT], b2[LUA_BAND_METER_COUNT];
+	float a1[LUA_BAND_METER_COUNT], a2[LUA_BAND_METER_COUNT];
+	float sum[LUA_BAND_METER_COUNT];
+	memcpy(s1, jdsp->bandMeterState1, sizeof(s1));
+	memcpy(s2, jdsp->bandMeterState2, sizeof(s2));
+	memcpy(b0, g_bandMeterB0, sizeof(b0));
+	memcpy(b2, g_bandMeterB2, sizeof(b2));
+	memcpy(a1, g_bandMeterA1, sizeof(a1));
+	memcpy(a2, g_bandMeterA2, sizeof(a2));
+	const float *left = jdsp->tmpBuffer[0];
+	const float *right = jdsp->tmpBuffer[1];
+	size_t i = 0;
+	while (i < n) {
+		size_t todo = (size_t)(frameSamples - jdsp->bandAccumCount);
+		if (todo > n - i) todo = n - i;
+		for (int b = 0; b < LUA_BAND_METER_COUNT; b++) sum[b] = 0.0f;
+		float monoSum = 0.0f;
+		for (size_t j = i; j < i + todo; j++) {
+			float mono = (left[j] + right[j]) * 0.5f;
+			monoSum += mono * mono;
+			for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
+				float y = b0[b] * mono + s1[b];
+				s1[b] = -a1[b] * y + s2[b]; // b1 == 0
+				s2[b] = b2[b] * mono - a2[b] * y;
+				sum[b] += y * y;
+			}
+		}
+		for (int b = 0; b < LUA_BAND_METER_COUNT; b++)
+			jdsp->bandAccum[b] += (double)sum[b];
+		jdsp->bandAccumMono += (double)monoSum;
+		jdsp->bandAccumCount += (int)todo;
+		i += todo;
+		if (jdsp->bandAccumCount >= frameSamples)
+			band_publish(jdsp);
+	}
+	memcpy(jdsp->bandMeterState1, s1, sizeof(s1));
+	memcpy(jdsp->bandMeterState2, s2, sizeof(s2));
 }
 // Flush-to-zero for denormals: reverb tails, delay lines, and IIR filter
 // state decaying toward silence routinely produce denormal floats, which
@@ -510,40 +628,15 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	// Run the chain
 	chain_process(jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
 
-	// Lua scripting tick — 30Hz
+	// Band meter: every sample, publishes 60 Hz frames (bands.bin).
+	// Full-spectrum + band taps both read the post-chain mix, never write
+	// it back -- analysis only.
+	band_meter_process(jdsp, n);
+
+	// Lua scripting tick — 30Hz; hands Lua the latest finished frame.
 	if (jdsp->luaTickCounter <= 0) {
-		if (jdsp->bandMeterCoeffFs != jdsp->fs) {
-			for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
-				double centerHz = 27.5 * pow(2.0, (double)b / 12.0);
-				bandmeter_update_coeffs(jdsp->fs, centerHz, CHROMA_Q, b);
-			}
-			jdsp->bandMeterCoeffFs = jdsp->fs;
-		}
-		float rms = 0.0f;
-		double bandSums[LUA_BAND_METER_COUNT];
-		for (int b = 0; b < LUA_BAND_METER_COUNT; b++) bandSums[b] = 0.0;
-		for (size_t i = 0; i < n; i++) {
-			// Full-spectrum + band taps both read the post-chain mix
-			// (a value), never write it back — analysis only.
-			float mono = (jdsp->tmpBuffer[0][i] + jdsp->tmpBuffer[1][i]) * 0.5f;
-			rms += mono * mono;
-			for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
-				float s1 = jdsp->bandMeterState1[b];
-				float s2 = jdsp->bandMeterState2[b];
-				float bandY = g_bandMeterB0[b] * mono + s1;
-				jdsp->bandMeterState1[b] = -g_bandMeterA1[b] * bandY + s2; // b1 == 0
-				jdsp->bandMeterState2[b] = g_bandMeterB2[b] * mono - g_bandMeterA2[b] * bandY;
-				bandSums[b] += (double)bandY * (double)bandY;
-			}
-		}
-		rms = sqrtf(rms / (float)n);
-		float bandEnergies[LUA_BAND_METER_COUNT];
-		for (int b = 0; b < LUA_BAND_METER_COUNT; b++)
-			bandEnergies[b] = sqrtf((float)(bandSums[b] / (double)n));
-		if (g_bandShm)
-			memcpy(g_bandShm, bandEnergies, LUA_BAND_METER_COUNT * sizeof(float));
-		lua_bridge_set_audio_level(rms);
-		lua_bridge_set_bands(bandEnergies, LUA_BAND_METER_COUNT);
+		lua_bridge_set_audio_level(jdsp->bandLatestRms);
+		lua_bridge_set_bands(jdsp->bandLatest, LUA_BAND_METER_COUNT);
 		lua_bridge_set_sample_rate((int)jdsp->fs);
 		lua_bridge_set_postgain(jdsp->postGain);
 		// Order must match g_module_names[] in lua_bridge.c
