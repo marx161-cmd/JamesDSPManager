@@ -11,11 +11,16 @@
 #include "generalDSP/ArbFIRGen.h"
 #define MAX_BENCHMARK (10)
 // Lua band-energy meter: number of analysis-only band taps (see JamesDSPLib
-// below + lua_bridge_set_bands()). Index 0 = bass, increasing toward treble.
-// Band center frequencies are log-spaced and fixed in
-// jdspController.c (g_bandMeterCenterHz); bump this count only together with
-// that array.
-#define LUA_BAND_METER_COUNT (5)
+// below + lua_bridge_set_bands()). 108 = 9 octave rows x 12 semitone columns
+// (pitch classes), mirroring comrade's shader-backdrop ROWS=9/COLS=12 grid.
+// Index b = row*12 + col; row 0 = lowest octave (A0 = 27.5 Hz), col 0 = A
+// .. col 11 = G#. Center frequencies are computed procedurally in
+// jdspController.c (chromatic grid), not a literal table.
+#define LUA_BAND_METER_COUNT (108)
+// Q for each bandmeter bandpass. Mirrors comrade's EasyEffects shader_bands
+// filter bank, which derives Q = f0/bandwidth; for log-spaced bands one
+// semitone apart (ratio = 2^(1/12)) that is sqrt(ratio)/(ratio-1) ~= 17.3.
+#define CHROMA_Q (17.3)
 // Misc
 extern double mapVal(double x, double in_min, double in_max, double out_min, double out_max);
 extern double mag2dB(double lin);

@@ -4,6 +4,10 @@
 #include <math.h>
 #include <time.h>
 #include <float.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include "Effects/eel2/dr_flac.h"
 #include "Effects/eel2/ns-eel.h"
 #include "jdsp_header.h"
@@ -239,19 +243,19 @@ void JamesDSPGlobalMemoryDeallocation()
 	NSEEL_quit();
 }
 // --- Lua band-energy meter -------------------------------------------------
-// Analysis-only RBJ constant-skirt-gain bandpass (peak gain = Q), Direct
-// Form II Transposed. Runs on a downmix COPY inside JamesDSPProcess, never
-// writes back into tmpBuffer, so it can never alter real playback the way
-// inserting a filter into a real signal graph (e.g. mpv's `af`) would.
-// Index 0 = bass, increasing toward treble. Center frequencies are
-// log-spaced to cover the full audible range at a fixed count; coeffs are
-// only recomputed when fs changes (cheap, 30Hz tick).
-static const double g_bandMeterCenterHz[LUA_BAND_METER_COUNT] = {
-    90.0, 250.0, 700.0, 2000.0, 6000.0
-};
-static const double g_bandMeterQ[LUA_BAND_METER_COUNT] = {
-    0.9, 1.0, 1.1, 1.2, 1.2
-};
+// Analysis-only RBJ bandpass with 0 dB peak gain (b0 = alpha/a0), Direct
+// Form II Transposed -- matching EasyEffects' BandFilter::design so band
+// energies stay comparable to the full-spectrum level instead of being
+// scaled by Q (the "peak gain = Q" form would inflate every tap by
+// ~20*log10(Q) dB and pin the meter at the ceiling). Runs on a downmix COPY
+// inside JamesDSPProcess, never writes back into tmpBuffer, so it can never
+// alter real playback the way inserting a filter into a real signal graph
+// (e.g. mpv's `af`) would.
+// 108 taps as a chromatic grid: index b = row*12 + col (row 0 = lowest
+// octave, A0 = 27.5 Hz; row 8 = highest, ~13.3 kHz; col 0 = A .. col 11 =
+// G#). Center Hz = 27.5 * 2^(b/12), computed procedurally when fs changes
+// (see JamesDSPProcess) -- coeffs are only recomputed then (cheap, 30Hz
+// tick), so there's no literal center/Q table to keep in sync.
 static float g_bandMeterB0[LUA_BAND_METER_COUNT], g_bandMeterB2[LUA_BAND_METER_COUNT];
 static float g_bandMeterA1[LUA_BAND_METER_COUNT], g_bandMeterA2[LUA_BAND_METER_COUNT];
 static void bandmeter_update_coeffs(double fs, double centerHz, double Q, int idx)
@@ -259,10 +263,40 @@ static void bandmeter_update_coeffs(double fs, double centerHz, double Q, int id
 	double w0 = 2.0 * M_PI * centerHz / fs;
 	double alpha = sin(w0) / (2.0 * Q);
 	double a0 = 1.0 + alpha;
-	g_bandMeterB0[idx] = (float)((Q * alpha) / a0);
-	g_bandMeterB2[idx] = (float)((-Q * alpha) / a0);
+	g_bandMeterB0[idx] = (float)(alpha / a0);
+	g_bandMeterB2[idx] = (float)(-alpha / a0);
 	g_bandMeterA1[idx] = (float)((-2.0 * cos(w0)) / a0);
 	g_bandMeterA2[idx] = (float)((1.0 - alpha) / a0);
+}
+// --- Raw band-energy bridge (bands.bin) ------------------------------------
+// The 108 raw linear-RMS band energies are shared out through a memory-mapped
+// file so the realtime audio thread does pure memory writes (no syscalls, no
+// file I/O in the steady state). ShaderEditor reads the same file and uploads
+// it as a sampler2D. Setup is idempotent and fails non-fatally (logged) if the
+// path isn't writable -- the meter keeps working, only the shm bridge is off.
+static float *g_bandShm = 0;
+static void band_shm_setup(void)
+{
+	if (g_bandShm) return;
+	const char *path = "/data/data/com.termux.jdsp/files/bands.bin";
+	int fd = open(path, O_RDWR | O_CREAT, 0666);
+	if (fd < 0) {
+		__android_log_print(ANDROID_LOG_WARN, TAG, "band shm open failed: %s", path);
+		return;
+	}
+	if (ftruncate(fd, (off_t)(LUA_BAND_METER_COUNT * sizeof(float))) != 0) {
+		__android_log_print(ANDROID_LOG_WARN, TAG, "band shm ftruncate failed");
+		close(fd);
+		return;
+	}
+	fchmod(fd, 0644);
+	void *p = mmap(0, LUA_BAND_METER_COUNT * sizeof(float), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (p == MAP_FAILED) {
+		__android_log_print(ANDROID_LOG_WARN, TAG, "band shm mmap failed");
+		return;
+	}
+	g_bandShm = (float *)p;
 }
 // Flush-to-zero for denormals: reverb tails, delay lines, and IIR filter
 // state decaying toward silence routinely produce denormal floats, which
@@ -479,8 +513,10 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	// Lua scripting tick — 30Hz
 	if (jdsp->luaTickCounter <= 0) {
 		if (jdsp->bandMeterCoeffFs != jdsp->fs) {
-			for (int b = 0; b < LUA_BAND_METER_COUNT; b++)
-				bandmeter_update_coeffs(jdsp->fs, g_bandMeterCenterHz[b], g_bandMeterQ[b], b);
+			for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
+				double centerHz = 27.5 * pow(2.0, (double)b / 12.0);
+				bandmeter_update_coeffs(jdsp->fs, centerHz, CHROMA_Q, b);
+			}
 			jdsp->bandMeterCoeffFs = jdsp->fs;
 		}
 		float rms = 0.0f;
@@ -504,6 +540,8 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 		float bandEnergies[LUA_BAND_METER_COUNT];
 		for (int b = 0; b < LUA_BAND_METER_COUNT; b++)
 			bandEnergies[b] = sqrtf((float)(bandSums[b] / (double)n));
+		if (g_bandShm)
+			memcpy(g_bandShm, bandEnergies, LUA_BAND_METER_COUNT * sizeof(float));
 		lua_bridge_set_audio_level(rms);
 		lua_bridge_set_bands(bandEnergies, LUA_BAND_METER_COUNT);
 		lua_bridge_set_sample_rate((int)jdsp->fs);
@@ -1303,6 +1341,10 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	__android_log_print(ANDROID_LOG_INFO, TAG, "Printing benchmark data end");
 #endif
 	lua_bridge_init();
+	// Set up the raw band-energy shm bridge (bands.bin). Idempotent; done
+	// here (effect init) so the mmap/open/truncate syscalls happen once, off
+	// the realtime processing path.
+	band_shm_setup();
 	// Auto-load a user script from a fixed path if present, mirroring mpv's
 	// scripts/-folder auto-load convenience — no UI/AIDL round-trip needed.
 	// Only one script slot exists (lua_bridge_load_script replaces globals
