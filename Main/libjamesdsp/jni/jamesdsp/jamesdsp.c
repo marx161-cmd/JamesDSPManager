@@ -132,10 +132,15 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
         return 0;
     }
 
-    // Limiter (1500): params = {threshold, attack, release, knee, postgain}
+    // Limiter (1500): params = {threshold, attack, release, knee, postgain[, enabled]}
     if (cmd == 1500 && nparams >= 5) {
+        if (nparams >= 6) d->jdsp.limiterEnabled = (params[5] >= 0.5f) ? 1 : 0;
+        jdsp_lock(&d->jdsp);
         lsp_limiter_configure(d->jdsp.limiter_handle, params[0], params[1], params[2], params[3]);
-        d->jdsp.postGain = params[4];
+        jdsp_unlock(&d->jdsp);
+        // dB in, like every other postgain path (was stored raw as a linear
+        // multiplier here -- review 2026-10-21).
+        JamesDSPSetPostGain(&d->jdsp, params[4]);
         return 0;
     }
 
@@ -191,9 +196,12 @@ static void lim_config(float out[4]) {
         for (int i = 0; i < 4; i++) out[i] = 0.0f;
 }
 static void lim_apply(const float c[4]) {
-    if (g_lua_cmd_dspmain)
+    if (g_lua_cmd_dspmain) {
+        jdsp_lock(&g_lua_cmd_dspmain->jdsp);
         lsp_limiter_configure(g_lua_cmd_dspmain->jdsp.limiter_handle,
                               c[0], c[1], c[2], c[3]);
+        jdsp_unlock(&g_lua_cmd_dspmain->jdsp);
+    }
 }
 
 #define JDSP_DYN_PROP(TAG, LOAD, APPLY, IDX, NC)                 \
@@ -382,6 +390,21 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 		JamesDSPSetSampleRate(&dspmain->jdsp, dspmain->mSamplingRate, 0);
 		*replyData = 0;
 		return 0;
+	}
+	// Hardening (2026-10-21): a vendor parameter blob is untrusted client
+	// input (any IEffect client can send one). An empty/short blob
+	// null-derefs below (observed: open() with an empty DefaultExtension ->
+	// SIGSEGV in EffectDSPMainCommand+320, i.e. the audio HAL process dies);
+	// a blob whose declared psize/vsize exceed cmdSize over-reads the Binder
+	// buffer. Reject both before any field is read.
+	if (cmdCode == EFFECT_CMD_GET_PARAM || cmdCode == EFFECT_CMD_SET_PARAM)
+	{
+		if (!pCmdData || cmdSize < sizeof(effect_param_t))
+			return -1;
+		effect_param_t *hdr = (effect_param_t *)pCmdData;
+		uint32_t need = (uint32_t)sizeof(effect_param_t) + ((hdr->psize + 3u) & ~3u) + hdr->vsize;
+		if (need < hdr->vsize || cmdSize < need)
+			return -1;
 	}
 	if (cmdCode == EFFECT_CMD_GET_PARAM)
 	{
@@ -907,7 +930,9 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 					postgain = 15.0;
 				if (postgain < -15.0)
 					postgain = -15.0;
+				jdsp_lock(&dspmain->jdsp);
 				JLimiterSetCoefficients(&dspmain->jdsp, limThreshold, limRelease);
+				jdsp_unlock(&dspmain->jdsp);
 				JamesDSPSetPostGain(&dspmain->jdsp, postgain);
 #ifdef DEBUG
 				LOGE("limThreshold: %f, limRelease: %f, postgain: %f", limThreshold, limRelease, postgain);
@@ -916,10 +941,10 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				return 0;
 			}
 		}
-		if (cep->psize == 4 && cep->vsize == 20)
+		if (cep->psize == 4 && (cep->vsize == 20 || cep->vsize == 24))
 		{
 			int32_t cmd = ((int32_t *)cep)[3];
-			if (cmd == 1500) // Limiter: threshold, attack, release, knee, postgain
+			if (cmd == 1500) // Limiter: threshold, attack, release, knee, postgain[, enabled]
 			{
 				float *p = (float *)cep;
 				double limThreshold = (double)p[4];
@@ -945,8 +970,17 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				// JLimiterSetCoefficients shim (which hardcodes attack=5ms,
 				// knee=1.0/no-knee) — this is the path that actually exposes
 				// attack/knee as real tunables from the UI.
+				// Locked against the audio thread's lsp_limiter_process() in
+				// JamesDSPProcess (review 2026-10-21): configure() runs
+				// sOver/sLimit update_settings() and set_delay() in place.
+				jdsp_lock(&dspmain->jdsp);
 				lsp_limiter_configure(dspmain->jdsp.limiter_handle, (float)limThreshold, (float)limAttack, (float)limRelease, (float)limKnee);
+				jdsp_unlock(&dspmain->jdsp);
 				JamesDSPSetPostGain(&dspmain->jdsp, postgain);
+				// Optional 6th float (vsize 24): output limiter on/off. Older
+				// app builds send 5 floats and leave it on (stock behaviour).
+				if (cep->vsize == 24)
+					dspmain->jdsp.limiterEnabled = (p[9] >= 0.5f) ? 1 : 0;
 				*replyData = 0;
 				return 0;
 			}

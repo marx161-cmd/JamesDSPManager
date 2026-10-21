@@ -242,6 +242,7 @@ void JamesDSPGlobalMemoryDeallocation()
 {
 	NSEEL_quit();
 }
+#if JDSP_LUA_BRIDGE
 // --- Lua band-energy meter -------------------------------------------------
 // Analysis-only RBJ bandpass with 0 dB peak gain (b0 = alpha/a0), Direct
 // Form II Transposed -- matching EasyEffects' BandFilter::design so band
@@ -416,6 +417,7 @@ static void band_meter_process(JamesDSPLib *jdsp, size_t n)
 	memcpy(jdsp->bandMeterState1, s1, sizeof(s1));
 	memcpy(jdsp->bandMeterState2, s2, sizeof(s2));
 }
+#endif // JDSP_LUA_BRIDGE
 // Flush-to-zero for denormals: reverb tails, delay lines, and IIR filter
 // state decaying toward silence routinely produce denormal floats, which
 // stall to slow microcoded handling on ARM cores instead of running at
@@ -628,6 +630,7 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	// Run the chain
 	chain_process(jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
 
+#if JDSP_LUA_BRIDGE
 	// Band meter: every sample, publishes 60 Hz frames (bands.bin).
 	// Full-spectrum + band taps both read the post-chain mix, never write
 	// it back -- analysis only.
@@ -691,13 +694,25 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	} else {
 		jdsp->luaTickCounter--;
 	}
+#endif // JDSP_LUA_BRIDGE
 
 	// Output limiter (LSP brickwall)
 	for (size_t i = 0; i < n; i++) {
 		jdsp->tmpBuffer[0][i] *= jdsp->postGain;
 		jdsp->tmpBuffer[1][i] *= jdsp->postGain;
 	}
-	lsp_limiter_process(jdsp->limiter_handle, jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
+	// Same lock the chain wrappers (w_gate_lsp/w_mb_dyn/w_conv/...) take:
+	// lsp_limiter_configure() mutates the limiter in place from the Binder
+	// thread (review 2026-10-21; the 09-04 lock commit covered Gate/Compressor
+	// only). The mutex is non-recursive and nothing outer holds it here.
+	// Opt-out like the other modules (2026-10-21). Hard skip, not a bypass
+	// crossfade: the limiter's ~5 ms lookahead vanishes in one step when it is
+	// switched off, so expect one tick at the toggle, never during playback.
+	if (jdsp->limiterEnabled) {
+		jdsp_lock(jdsp);
+		lsp_limiter_process(jdsp->limiter_handle, jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
+		jdsp_unlock(jdsp);
+	}
 }
 void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 {
@@ -1396,6 +1411,7 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	JLimiterInit(jdsp);
 	JLimiterSetCoefficients(jdsp, -(double)(FLT_EPSILON * 10.0f), 100.0);
 	jdsp->postGain = 1.0f;
+	jdsp->limiterEnabled = 1;
 	// Init effect
 	LiveProgConstructor(jdsp);
 	BassBoostConstructor(jdsp);
@@ -1433,6 +1449,7 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 		__android_log_print(ANDROID_LOG_INFO, TAG, "%1.7lf,%1.7lf", convbench_c0[s], convbench_c1[s]);
 	__android_log_print(ANDROID_LOG_INFO, TAG, "Printing benchmark data end");
 #endif
+#if JDSP_LUA_BRIDGE
 	lua_bridge_init();
 	// Set up the raw band-energy shm bridge (bands.bin). Idempotent; done
 	// here (effect init) so the mmap/open/truncate syscalls happen once, off
@@ -1461,6 +1478,7 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	}
 	if (jdsp->luaScript && jdsp->luaScript[0])
 		lua_bridge_load_script(jdsp->luaScript);
+#endif // JDSP_LUA_BRIDGE
 	jdsp->compressor_handle = lsp_comp_create(sample_rate);
 	jdsp->gate_handle = lsp_gate_create(sample_rate);
 	lsp_gate_configure(jdsp->gate_handle, -40.0f, -50.0f, 1.0f, 50.0f, 10.0f, -60.0f);

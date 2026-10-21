@@ -560,6 +560,9 @@ typedef struct dspsys
 	// Live programmable effect
 	int liveprogEnabled;
 	LiveProg eel;
+	// Output limiter (LSP) on/off. Default 1 (stock always ran it). Set by cmd
+	// 1500's optional 6th float (vsize 24) -- 2026-10-21.
+	int limiterEnabled;
 	// Arbitrary magnitude response
 	int arbitraryMagEnabled, arbMagForceRefresh;
 	arbitraryMagnitude arbMag;
