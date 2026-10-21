@@ -13,6 +13,8 @@
 #include "jdsp/jdsp_header.h"
 #include "lua_bridge.h"
 #include "lsp_wrap.h"
+#include "lsp_wrap_expander.h"
+#include "lsp_wrap_autogain.h"
 typedef struct
 {
 	unsigned long long initializeForFirst;
@@ -110,18 +112,32 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
     if (cmd == 10100 && nparams >= 1) {
         d->jdsp.gateEnabled = (int)params[0];
         if (nparams >= 7 && d->jdsp.gateEnabled) {
-            jdsp_lock(&d->jdsp);
             lsp_gate_configure(d->jdsp.gate_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
-            jdsp_unlock(&d->jdsp);
         }
         return 0;
     }
     if (cmd == 10101 && nparams >= 1) {
         d->jdsp.mbDynEnabled = (int)params[0];
         if (nparams >= 7 && d->jdsp.mbDynEnabled) {
-            jdsp_lock(&d->jdsp);
             lsp_comp_configure(d->jdsp.compressor_handle, params[1], params[2], params[3], params[4], params[5], params[6]);
-            jdsp_unlock(&d->jdsp);
+        }
+        return 0;
+    }
+    // Expander (10103): {en[, mode, threshold_db, ratio, knee(linear), attack, release, hold]}
+    if (cmd == 10103 && nparams >= 1) {
+        d->jdsp.expanderEnabled = (int)params[0];
+        if (nparams >= 8 && d->jdsp.expanderEnabled) {
+            lsp_exp_configure(d->jdsp.expander_handle, (int)params[1], params[2], params[3], params[4], params[5], params[6], params[7]);
+        }
+        return 0;
+    }
+    // Autogain (10104): {en[, level_lufs, long_period_ms, short_period_ms,
+    // drift_db, silence_lufs, max_gain_db, max_gain_on]}. Enable flag is the
+    // same autogainEnabled that legacy cmd 1207 sets.
+    if (cmd == 10104 && nparams >= 1) {
+        d->jdsp.autogainEnabled = (int)params[0];
+        if (nparams >= 8 && d->jdsp.autogainEnabled) {
+            lsp_autogain_configure(d->jdsp.autogain_handle, params[1], params[2], params[3], params[4], params[5], params[6], (int)params[7]);
         }
         return 0;
     }
@@ -135,9 +151,7 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
     // Limiter (1500): params = {threshold, attack, release, knee, postgain[, enabled]}
     if (cmd == 1500 && nparams >= 5) {
         if (nparams >= 6) d->jdsp.limiterEnabled = (params[5] >= 0.5f) ? 1 : 0;
-        jdsp_lock(&d->jdsp);
         lsp_limiter_configure(d->jdsp.limiter_handle, params[0], params[1], params[2], params[3]);
-        jdsp_unlock(&d->jdsp);
         // dB in, like every other postgain path (was stored raw as a linear
         // multiplier here -- review 2026-10-21).
         JamesDSPSetPostGain(&d->jdsp, params[4]);
@@ -165,10 +179,8 @@ static void comp_config(float out[6]) {
 }
 static void comp_apply(const float c[6]) {
     if (g_lua_cmd_dspmain) {
-        jdsp_lock(&g_lua_cmd_dspmain->jdsp);
         lsp_comp_configure(g_lua_cmd_dspmain->jdsp.compressor_handle,
                            c[0], c[1], c[2], c[3], c[4], c[5]);
-        jdsp_unlock(&g_lua_cmd_dspmain->jdsp);
     }
 }
 
@@ -181,10 +193,8 @@ static void gate_config(float out[6]) {
 }
 static void gate_apply(const float c[6]) {
     if (g_lua_cmd_dspmain) {
-        jdsp_lock(&g_lua_cmd_dspmain->jdsp);
         lsp_gate_configure(g_lua_cmd_dspmain->jdsp.gate_handle,
                            c[0], c[1], c[2], c[3], c[4], c[5]);
-        jdsp_unlock(&g_lua_cmd_dspmain->jdsp);
     }
 }
 
@@ -197,10 +207,8 @@ static void lim_config(float out[4]) {
 }
 static void lim_apply(const float c[4]) {
     if (g_lua_cmd_dspmain) {
-        jdsp_lock(&g_lua_cmd_dspmain->jdsp);
         lsp_limiter_configure(g_lua_cmd_dspmain->jdsp.limiter_handle,
                               c[0], c[1], c[2], c[3]);
-        jdsp_unlock(&g_lua_cmd_dspmain->jdsp);
     }
 }
 
@@ -843,9 +851,7 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				int en = (int)roundf(p[5]);
 				dspmain->jdsp.gateEnabled = en;
 				if (en) {
-					jdsp_lock(&dspmain->jdsp);
 					lsp_gate_configure(dspmain->jdsp.gate_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
-					jdsp_unlock(&dspmain->jdsp);
 				}
 				*replyData = 0;
 				return 0;
@@ -856,15 +862,48 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				int en = (int)roundf(p[5]);
 				dspmain->jdsp.mbDynEnabled = en;
 				if (en) {
-					jdsp_lock(&dspmain->jdsp);
 					lsp_comp_configure(dspmain->jdsp.compressor_handle, p[6], p[7], p[8], p[9], p[10], p[11]);
-					jdsp_unlock(&dspmain->jdsp);
 				}
 				*replyData = 0;
 				return 0;
 			}
 			else if (cmd == 10102) // MB EQ: (no-op, single-band)
 			{
+				*replyData = 0;
+				return 0;
+			}
+		}
+		// Expander (10103): 9-float payload (36 bytes) at int32 index 4..12 =
+		// [band(unused)=0, enabled, mode(0=down,1=up), threshold_db, ratio,
+		//  knee(linear), attack_ms, release_ms, hold_ms]. Same shape as
+		// 10100/10101 above; no jdsp_lock (lsp_exp_configure publishes,
+		// the audio thread applies -- rt_config.h).
+		if (cep->psize == 4 && cep->vsize == 36)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 10103)
+			{
+				float *p = (float *)cep;
+				int en = (int)roundf(p[5]);
+				dspmain->jdsp.expanderEnabled = en;
+				if (en) {
+					lsp_exp_configure(dspmain->jdsp.expander_handle, (int)roundf(p[6]), p[7], p[8], p[9], p[10], p[11], p[12]);
+				}
+				*replyData = 0;
+				return 0;
+			}
+			// Autogain (10104): same 9-float shape, int32 index 4..12 =
+			// [band(unused)=0, enabled, level_lufs, long_period_ms, short_period_ms,
+			//  drift_db, silence_lufs, max_gain_db, max_gain_on]. Sets the same
+			// autogainEnabled flag as legacy cmd 1207.
+			else if (cmd == 10104)
+			{
+				float *p = (float *)cep;
+				int en = (int)roundf(p[5]);
+				dspmain->jdsp.autogainEnabled = en;
+				if (en) {
+					lsp_autogain_configure(dspmain->jdsp.autogain_handle, p[6], p[7], p[8], p[9], p[10], p[11], (int)roundf(p[12]));
+				}
 				*replyData = 0;
 				return 0;
 			}
@@ -930,9 +969,7 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 					postgain = 15.0;
 				if (postgain < -15.0)
 					postgain = -15.0;
-				jdsp_lock(&dspmain->jdsp);
 				JLimiterSetCoefficients(&dspmain->jdsp, limThreshold, limRelease);
-				jdsp_unlock(&dspmain->jdsp);
 				JamesDSPSetPostGain(&dspmain->jdsp, postgain);
 #ifdef DEBUG
 				LOGE("limThreshold: %f, limRelease: %f, postgain: %f", limThreshold, limRelease, postgain);
@@ -970,12 +1007,9 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				// JLimiterSetCoefficients shim (which hardcodes attack=5ms,
 				// knee=1.0/no-knee) — this is the path that actually exposes
 				// attack/knee as real tunables from the UI.
-				// Locked against the audio thread's lsp_limiter_process() in
-				// JamesDSPProcess (review 2026-10-21): configure() runs
-				// sOver/sLimit update_settings() and set_delay() in place.
-				jdsp_lock(&dspmain->jdsp);
+				// No lock: configure() only publishes; the audio thread applies
+				// it at its next block (rt_config.h).
 				lsp_limiter_configure(dspmain->jdsp.limiter_handle, (float)limThreshold, (float)limAttack, (float)limRelease, (float)limKnee);
-				jdsp_unlock(&dspmain->jdsp);
 				JamesDSPSetPostGain(&dspmain->jdsp, postgain);
 				// Optional 6th float (vsize 24): output limiter on/off. Older
 				// app builds send 5 floats and leave it on (stock behaviour).

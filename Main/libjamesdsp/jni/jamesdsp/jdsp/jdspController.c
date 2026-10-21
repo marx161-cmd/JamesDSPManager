@@ -13,6 +13,8 @@
 #include "jdsp_header.h"
 #include "lua_bridge.h"
 #include "lsp_wrap.h"
+#include "lsp_wrap_expander.h"
+#include "lsp_wrap_autogain.h"
 #include "chain_modules.h"
 #define TAG "EffectDSPMain"
 
@@ -573,9 +575,18 @@ static void w_bassboost(float *L, float *R, unsigned n)  { lua_bridge_hook_fire(
 // hard skip made enabling/disabling either from the UI an instant step in
 // gain, audible as a click. They're always called now; each is a near-zero
 // -cost no-op once its own Bypass has settled fully disabled.
-static void w_mb_dyn(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("compressor", L, R, (int)n); jdsp_lock(g_chain_jdsp); lsp_comp_process(g_chain_jdsp->compressor_handle, L, R, n, g_chain_jdsp->mbDynEnabled); jdsp_unlock(g_chain_jdsp); }
-static void w_gate_lsp(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("gate", L, R, (int)n); jdsp_lock(g_chain_jdsp); lsp_gate_process(g_chain_jdsp->gate_handle, L, R, n, g_chain_jdsp->gateEnabled); jdsp_unlock(g_chain_jdsp); }
-static void w_autogain(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("autogain", L, R, (int)n); autogain_process(L, R, n); }
+// Gate/Compressor/Limiter: no jdsp_lock -- their configure() publishes a
+// config the audio thread applies itself (rt_config.h, 2026-10-21), so the
+// audio thread never waits behind the convolver/DDC/LiveProg loaders.
+static void w_mb_dyn(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("compressor", L, R, (int)n); lsp_comp_process(g_chain_jdsp->compressor_handle, L, R, n, g_chain_jdsp->mbDynEnabled); }
+static void w_gate_lsp(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("gate", L, R, (int)n); lsp_gate_process(g_chain_jdsp->gate_handle, L, R, n, g_chain_jdsp->gateEnabled); }
+// Expander: same contract as gate/compressor above -- always called, owns
+// its Bypass crossfade, no jdsp_lock (rt_config.h handoff).
+static void w_expander(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("expander", L, R, (int)n); lsp_exp_process(g_chain_jdsp->expander_handle, L, R, n, g_chain_jdsp->expanderEnabled); }
+// Autogain: real LSP Autogain port (lsp_wrap_autogain.cpp) replaced the
+// chain_modules.c RMS integrator (2026-10-21). Same contract as gate/
+// compressor: always called, owns its Bypass crossfade, no jdsp_lock.
+static void w_autogain(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("autogain", L, R, (int)n); lsp_autogain_process(g_chain_jdsp->autogain_handle, L, R, n, g_chain_jdsp->autogainEnabled); }
 // No chain wrapper for the limiter: it's applied once, explicitly, at the
 // end of JamesDSPProcess() after postGain — that's the real "last line of
 // defense" position. It used to ALSO run mid-chain via chain_register()
@@ -594,13 +605,16 @@ static void chain_init_static(void) {
 	// instance silently controlled another's chain.
 	chain_reset();
 
-	chain_register("autogain",   w_autogain,         &g_chain_jdsp->autogainEnabled);
+	// autogain: NULL toggle like gate/compressor -- the LSP port self-gates
+	// via its Bypass so the enable/disable crossfade actually runs.
+	chain_register("autogain",   w_autogain,         NULL);
 	// gate/compressor: NULL toggle here is deliberate — chain_process()
 	// must always call them so their internal Bypass crossfade can run
 	// during the ~5ms enable/disable transition. They self-gate via
 	// lsp_wrap.cpp's Bypass (near-zero cost once fully settled disabled),
 	// not via chain_process()'s hard skip.
 	chain_register("gate",       w_gate_lsp,         NULL);
+	chain_register("expander",   w_expander,         NULL);
 	chain_register("tube",       w_tube,             &g_chain_jdsp->tubeEnabled);
 	chain_register("compressor", w_mb_dyn,           NULL);
 	chain_register("bassboost",  w_bassboost,        &g_chain_jdsp->bassBoostEnabled);
@@ -616,8 +630,8 @@ static void chain_init_static(void) {
 
 	// Order matches stock's original chain position: bass boost right after
 	// the compressor, before EQ.
-	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
-	chain_set_order(default_order, 14);
+	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+	chain_set_order(default_order, 15);
 }
 
 // Process
@@ -643,14 +657,15 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 		lua_bridge_set_sample_rate((int)jdsp->fs);
 		lua_bridge_set_postgain(jdsp->postGain);
 		// Order must match g_module_names[] in lua_bridge.c
-		int moduleStates[13] = {
+		int moduleStates[14] = {
 			jdsp->gateEnabled, jdsp->mbDynEnabled, jdsp->autogainEnabled,
 			jdsp->reverbEnabled, jdsp->sterEnhEnabled, jdsp->tubeEnabled,
 			jdsp->convolverEnabled, jdsp->equalizerEnabled, jdsp->crossfeedEnabled,
 			jdsp->ddcEnabled, jdsp->arbitraryMagEnabled, jdsp->liveprogEnabled,
-			1 // lua module always runs (self-gating)
+			1, // lua module always runs (self-gating)
+			jdsp->expanderEnabled
 		};
-		lua_bridge_set_module_states(moduleStates, 13);
+		lua_bridge_set_module_states(moduleStates, 14);
 
 		// Telemetry properties (mpv-style property tree). These are live
 		// values refreshed each tick; the limiter runs *after* this tick, so
@@ -661,12 +676,18 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 			lsp_gate_is_closed(jdsp->gate_handle) ? 1.0 : 0.0);
 		lua_bridge_set_property_number("compressor.gain_reduction_db",
 			(double)lsp_comp_get_reduction_db(jdsp->compressor_handle));
+		lua_bridge_set_property_number("expander.gain_reduction_db",
+			(double)lsp_exp_get_reduction_db(jdsp->expander_handle));
+		lua_bridge_set_property_number("expander.active",
+			lsp_exp_is_active(jdsp->expander_handle) ? 1.0 : 0.0);
 		lua_bridge_set_property_number("limiter.gain_reduction_db",
 			(double)lsp_limiter_get_reduction_db(jdsp->limiter_handle));
 		lua_bridge_set_property_number("limiter.limiting",
 			lsp_limiter_is_limiting(jdsp->limiter_handle) ? 1.0 : 0.0);
 		lua_bridge_set_property_number("autogain.current_gain_db",
-			(double)autogain_get_gain_db());
+			(double)lsp_autogain_get_gain_db(jdsp->autogain_handle));
+		lua_bridge_set_property_number("autogain.input_lufs",
+			(double)lsp_autogain_get_input_lufs(jdsp->autogain_handle));
 		lua_bridge_set_property_number("convolver.active",
 			(jdsp->convolverEnabled && jdsp->conv.process != NULL) ? 1.0 : 0.0);
 		lua_bridge_set_property_number("convolver.impulse_length",
@@ -701,18 +722,12 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 		jdsp->tmpBuffer[0][i] *= jdsp->postGain;
 		jdsp->tmpBuffer[1][i] *= jdsp->postGain;
 	}
-	// Same lock the chain wrappers (w_gate_lsp/w_mb_dyn/w_conv/...) take:
-	// lsp_limiter_configure() mutates the limiter in place from the Binder
-	// thread (review 2026-10-21; the 09-04 lock commit covered Gate/Compressor
-	// only). The mutex is non-recursive and nothing outer holds it here.
 	// Opt-out like the other modules (2026-10-21). Hard skip, not a bypass
 	// crossfade: the limiter's ~5 ms lookahead vanishes in one step when it is
 	// switched off, so expect one tick at the toggle, never during playback.
-	if (jdsp->limiterEnabled) {
-		jdsp_lock(jdsp);
+	// No jdsp_lock: limiter configure() publishes, process() applies (rt_config.h).
+	if (jdsp->limiterEnabled)
 		lsp_limiter_process(jdsp->limiter_handle, jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
-		jdsp_unlock(jdsp);
-	}
 }
 void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 {
@@ -1481,7 +1496,20 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 #endif // JDSP_LUA_BRIDGE
 	jdsp->compressor_handle = lsp_comp_create(sample_rate);
 	jdsp->gate_handle = lsp_gate_create(sample_rate);
+	jdsp->expander_handle = lsp_exp_create(sample_rate);
 	lsp_gate_configure(jdsp->gate_handle, -40.0f, -50.0f, 1.0f, 50.0f, 10.0f, -60.0f);
+	// Expander defaults = the real plugin's metadata defaults
+	// (lsp-expander/include/private/meta/expander.h): EM_DEFAULT = EM_UPWARD (1),
+	// ATTACK_LVL_DFL = -12 dB, RATIO_DFL = 4, KNEE_DFL = GAIN_AMP_M_6_DB (0.50118,
+	// linear), ATTACK_TIME_DFL = 20 ms, RELEASE_TIME_DFL = 100 ms, HOLD_TIME_DFL = 0.
+	// Inert until expanderEnabled is set (zero-init off, Bypass engaged).
+	lsp_exp_configure(jdsp->expander_handle, 1, -12.0f, 4.0f, 0.50118f, 20.0f, 100.0f, 0.0f);
+	// Autogain defaults = the real plugin's metadata defaults
+	// (lsp-autogain/include/private/meta/autogain.h): LEVEL_DFL = -23 LUFS,
+	// LONG_PERIOD_DFL = 400 ms, SHORT_PERIOD_DFL = 20 ms, DEVIATION_DFL = 12 dB,
+	// SILENCE_DFL = -72 LUFS, MAX_GAIN_DFL = 36 dB, max_on SWITCH dfl 0.
+	jdsp->autogain_handle = lsp_autogain_create(sample_rate);
+	lsp_autogain_configure(jdsp->autogain_handle, -23.0f, 400.0f, 20.0f, 12.0f, -72.0f, 36.0f, 0);
 	lsp_comp_configure(jdsp->compressor_handle, -24.0f, 4.0f, 1.0f, 5.0f, 100.0f, 10.0f);
 }
 void JamesDSPSetPostGain(JamesDSPLib *jdsp, double pGaindB)
@@ -1562,9 +1590,13 @@ void JamesDSPFree(JamesDSPLib *jdsp)
 	lua_bridge_destroy();
 	lsp_comp_destroy(jdsp->compressor_handle);
 	lsp_gate_destroy(jdsp->gate_handle);
+	lsp_exp_destroy(jdsp->expander_handle);
+	lsp_autogain_destroy(jdsp->autogain_handle);
 	lsp_limiter_destroy(jdsp->limiter_handle);
 	jdsp->compressor_handle = NULL;
 	jdsp->gate_handle = NULL;
+	jdsp->expander_handle = NULL;
+	jdsp->autogain_handle = NULL;
 	jdsp->limiter_handle = NULL;
 	if (jdsp->luaScript) {
 		free(jdsp->luaScript);

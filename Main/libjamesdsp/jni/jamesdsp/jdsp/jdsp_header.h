@@ -571,6 +571,14 @@ typedef struct dspsys
 	void *limiter_handle;
 	void *compressor_handle;
 	void *gate_handle;
+	// Expander (LSP faithful port, lsp_wrap_expander.cpp) — appended after
+	// the gate fields; defaults off via the struct's zero-init.
+	void *expander_handle;
+	int expanderEnabled;
+	// Autogain (LSP faithful port, lsp_wrap_autogain.cpp) -- replaces the
+	// legacy chain_modules.c RMS integrator; enable flag is the existing
+	// autogainEnabled above (cmd 1207).
+	void *autogain_handle;
 	size_t blockSize, blockSizeMax, pw2BlockMemSize;
 	float *tmpBuffer[6];
 	// Internal function pointer
