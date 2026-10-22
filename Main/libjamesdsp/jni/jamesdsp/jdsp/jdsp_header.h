@@ -17,10 +17,29 @@
 // .. col 11 = G#. Center frequencies are computed procedurally in
 // jdspController.c (chromatic grid), not a literal table.
 #define LUA_BAND_METER_COUNT (108)
-// Q for each bandmeter bandpass. Mirrors comrade's EasyEffects shader_bands
-// filter bank, which derives Q = f0/bandwidth; for log-spaced bands one
-// semitone apart (ratio = 2^(1/12)) that is sqrt(ratio)/(ratio-1) ~= 17.3.
-#define CHROMA_Q (17.3)
+// Band filter bank (2026-10-22, parity with comrade's EasyEffects shader_bands
+// plugin / shader-backdrop band_filters.py, which mirror each other): per band
+// a Butterworth bandpass with its -3 dB edges half a semitone either side of
+// the centre, built as one biquad per order; the order per octave row follows
+// the desktop's [filters] orders default (its first 9 of 10 octaves). Before
+// this each band was a single RBJ biquad at Q 17.3 (neighbour semitone only
+// -7 dB down, an octave -28 dB; the desktop design gives -12/-57 dB in the
+// bass rows and -24/-115 dB in the treble rows).
+#define BAND_MAX_STAGES (4)
+#define BAND_ROWS (LUA_BAND_METER_COUNT / 12)
+// Named ranges (sub, bass, lowmid, mid, highmid, presence, brilliance) and the
+// per-frame feature block, same order and meaning as the desktop's
+// shared_bands.h meta fields: rms, the 7 named ranges, centroid, flux, onset.
+#define BAND_NAMED_COUNT (7)
+#define BAND_FEATURE_COUNT (11)
+// Cooked frame: desktop norm_db floor and envelope ballistics (shader_bands.cpp
+// FLOOR_DB, envelope/attack_ms + release_ms defaults), centroid normalisation
+// top (LOG_HI), onset baseline time constant.
+#define BAND_DB_FLOOR (-60.0)
+#define BAND_ENV_ATTACK_MS (60.0)
+#define BAND_ENV_RELEASE_MS (70.0)
+#define BAND_LOG_HI (28160.0)
+#define BAND_ONSET_BASELINE_S (1.5)
 // bands.bin publish rate and history ring (see band_publish in
 // jdspController.c for the file layout).
 #define BAND_FRAME_HZ (60.0)
@@ -627,11 +646,15 @@ typedef struct dspsys
 	// Lua band-energy meter: analysis-only bandpass taps, run on a downmix
 	// copy so they never touch tmpBuffer/real output (unlike mpv's af-graph,
 	// which can't branch a filtered copy without altering real playback).
-	// Direct Form II Transposed biquad state per band; coeffs recomputed
-	// only when fs changes.
-	float bandMeterState1[LUA_BAND_METER_COUNT];
-	float bandMeterState2[LUA_BAND_METER_COUNT];
+	// Direct Form II Transposed biquad state per band and stage, stage-major
+	// ([stage * LUA_BAND_METER_COUNT + band]); coeffs recomputed only when fs
+	// changes. Named-range filters: one RBJ biquad each (double, as on the desktop).
+	float bandMeterState1[LUA_BAND_METER_COUNT * BAND_MAX_STAGES];
+	float bandMeterState2[LUA_BAND_METER_COUNT * BAND_MAX_STAGES];
 	double bandMeterCoeffFs;
+	double bandNamedZ1[BAND_NAMED_COUNT];
+	double bandNamedZ2[BAND_NAMED_COUNT];
+	double bandNamedAccum[BAND_NAMED_COUNT];
 	// Continuous meter (2026-10-10): the taps run on EVERY sample; energy
 	// accumulates until one frame (fs / BAND_FRAME_HZ samples) has passed,
 	// then that frame is published (bands.bin latest + ring, Lua).
@@ -641,6 +664,19 @@ typedef struct dspsys
 	unsigned int bandFrameSeq;
 	float bandLatest[LUA_BAND_METER_COUNT];
 	float bandLatestRms;
+	// Cooked frame (2026-10-22): the desktop feed's view of the same bands --
+	// norm_db 0..1 with attack/release envelopes, named ranges, centroid, flux,
+	// onset -- so phone shaders ported from comrade see identical semantics.
+	float bandPrevDb[LUA_BAND_METER_COUNT];     // last frame's norm_db per band (flux)
+	double bandEnv[LUA_BAND_METER_COUNT];
+	double bandNamedEnv[BAND_NAMED_COUNT];
+	double bandRmsEnv;
+	double bandCentroidEnv;
+	double bandFluxEnv;
+	double bandOnsetEnv;
+	double bandOnsetBaseline;
+	float bandCooked[LUA_BAND_METER_COUNT];
+	float bandFeatures[BAND_FEATURE_COUNT];
 } JamesDSPLib;
 // JamesDSP controller
 extern void JamesDSPGlobalMemoryAllocation();

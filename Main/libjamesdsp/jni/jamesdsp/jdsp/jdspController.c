@@ -247,31 +247,122 @@ void JamesDSPGlobalMemoryDeallocation()
 	NSEEL_quit();
 }
 #if JDSP_LUA_BRIDGE
-// --- Lua band-energy meter -------------------------------------------------
-// Analysis-only RBJ bandpass with 0 dB peak gain (b0 = alpha/a0), Direct
-// Form II Transposed -- matching EasyEffects' BandFilter::design so band
-// energies stay comparable to the full-spectrum level instead of being
-// scaled by Q (the "peak gain = Q" form would inflate every tap by
-// ~20*log10(Q) dB and pin the meter at the ceiling). Runs on a downmix COPY
-// inside JamesDSPProcess, never writes back into tmpBuffer, so it can never
-// alter real playback the way inserting a filter into a real signal graph
-// (e.g. mpv's `af`) would.
-// 108 taps as a chromatic grid: index b = row*12 + col (row 0 = lowest
-// octave, A0 = 27.5 Hz; row 8 = highest, ~13.3 kHz; col 0 = A .. col 11 =
-// G#). Center Hz = 27.5 * 2^(b/12), computed procedurally when fs changes
-// (see JamesDSPProcess) -- coeffs are only recomputed then (cheap, 30Hz
-// tick), so there's no literal center/Q table to keep in sync.
-static float g_bandMeterB0[LUA_BAND_METER_COUNT], g_bandMeterB2[LUA_BAND_METER_COUNT];
-static float g_bandMeterA1[LUA_BAND_METER_COUNT], g_bandMeterA2[LUA_BAND_METER_COUNT];
-static void bandmeter_update_coeffs(double fs, double centerHz, double Q, int idx)
+// --- Band-energy meter -----------------------------------------------------
+// Analysis-only filter bank on a mono downmix COPY inside JamesDSPProcess;
+// it never writes back into tmpBuffer, so it can never alter real playback
+// the way inserting a filter into a real signal graph (e.g. mpv's `af`)
+// would. 108 bands as a chromatic grid: index b = row*12 + col (row 0 =
+// lowest octave, A0 = 27.5 Hz; row 8 = highest, ~13.3 kHz; col 0 = A ..
+// col 11 = G#), centre Hz = 27.5 * 2^(b/12).
+//
+// Design (2026-10-22) = the desktop's, transliterated from EasyEffects
+// shader_bands.cpp design_butterworth_bandpass() (mirrored by shader-backdrop
+// band_filters.py, verified there against scipy to 0.001 dB): analog
+// Butterworth lowpass prototype -> lowpass-to-bandpass -> bilinear with
+// prewarped edges at f0 / 2^(1/24) and f0 * 2^(1/24); each biquad has zeros
+// at z = +1 and z = -1 (b1 = 0, b2 = -b0); the cascade is normalised to 0 dB
+// at the centre. Order per octave row = g_bandOrders[]. Coeffs are stored
+// stage-major so the per-row inner loop runs over 12 contiguous bands.
+static const int g_bandOrders[BAND_ROWS] = {2, 2, 2, 3, 3, 4, 4, 4, 4};
+static float g_bandB0[BAND_MAX_STAGES][LUA_BAND_METER_COUNT];
+static float g_bandA1[BAND_MAX_STAGES][LUA_BAND_METER_COUNT];
+static float g_bandA2[BAND_MAX_STAGES][LUA_BAND_METER_COUNT];
+static float g_bandCenterHz[LUA_BAND_METER_COUNT];
+// Named ranges: one RBJ bandpass each (0 dB peak gain, b0 = alpha/a0),
+// q = clamp(f0 / (hi - lo), 0.7, 12), exactly as the desktop's BandFilter.
+static const double g_bandNamedEdges[BAND_NAMED_COUNT][2] = {
+	{20.0, 60.0}, {60.0, 250.0}, {250.0, 500.0}, {500.0, 2000.0},
+	{2000.0, 4000.0}, {4000.0, 8000.0}, {8000.0, 16000.0}};
+static double g_bandNamedB0[BAND_NAMED_COUNT], g_bandNamedA1[BAND_NAMED_COUNT], g_bandNamedA2[BAND_NAMED_COUNT];
+// Envelope coefficients at the 60 Hz frame rate (desktop: per audio block,
+// ms-based, so the same ballistics).
+static double g_bandEnvAttack, g_bandEnvRelease, g_bandOnsetBaselineCoef;
+
+typedef struct { double re, im; } bandCplx;
+static bandCplx bandCplxDiv(bandCplx a, bandCplx b)
 {
-	double w0 = 2.0 * M_PI * centerHz / fs;
-	double alpha = sin(w0) / (2.0 * Q);
-	double a0 = 1.0 + alpha;
-	g_bandMeterB0[idx] = (float)(alpha / a0);
-	g_bandMeterB2[idx] = (float)(-alpha / a0);
-	g_bandMeterA1[idx] = (float)((-2.0 * cos(w0)) / a0);
-	g_bandMeterA2[idx] = (float)((1.0 - alpha) / a0);
+	double d = b.re * b.re + b.im * b.im;
+	bandCplx r = {(a.re * b.re + a.im * b.im) / d, (a.im * b.re - a.re * b.im) / d};
+	return r;
+}
+// Butterworth bandpass for band `b`: -3 dB at f_lo / f_hi, `order` stages.
+// Returns the number of stages written (0 = band above Nyquist -> silent,
+// every stage zeroed so the fixed per-row stage count still holds).
+static int bandmeter_design_butter(double fs, double f_lo, double f_hi, int order, int b)
+{
+	for (int k = 0; k < BAND_MAX_STAGES; k++) {
+		g_bandB0[k][b] = 0.0f; g_bandA1[k][b] = 0.0f; g_bandA2[k][b] = 0.0f;
+	}
+	if (f_hi >= 0.49 * fs) return 0;
+	double wlo = 2.0 * fs * tan(M_PI * f_lo / fs);
+	double whi = 2.0 * fs * tan(M_PI * f_hi / fs);
+	double w0sq = wlo * whi, bw = whi - wlo;
+	double b0s[BAND_MAX_STAGES], a1s[BAND_MAX_STAGES], a2s[BAND_MAX_STAGES];
+	int n = 0;
+	for (int k = 0; k < order && n < order; k++) {
+		double theta = M_PI * (2.0 * k + order + 1.0) / (2.0 * order);
+		bandCplx p = {cos(theta), sin(theta)};
+		// disc = sqrt(p^2 * bw^2 - 4 * w0sq), principal branch
+		bandCplx A = {(p.re * p.re - p.im * p.im) * bw * bw - 4.0 * w0sq, 2.0 * p.re * p.im * bw * bw};
+		double r = sqrt(A.re * A.re + A.im * A.im);
+		bandCplx disc = {sqrt(fmax((r + A.re) * 0.5, 0.0)), sqrt(fmax((r - A.re) * 0.5, 0.0))};
+		if (A.im < 0.0) disc.im = -disc.im;
+		for (int cnd = 0; cnd < 2; cnd++) {
+			double sg = cnd == 0 ? 1.0 : -1.0;
+			bandCplx s = {(p.re * bw + sg * disc.re) * 0.5, (p.im * bw + sg * disc.im) * 0.5};
+			if (s.im <= 0.0 || n >= order) continue;
+			bandCplx num = {2.0 * fs + s.re, s.im}, den = {2.0 * fs - s.re, -s.im};
+			bandCplx z = bandCplxDiv(num, den);
+			b0s[n] = 1.0;
+			a1s[n] = -2.0 * z.re;
+			a2s[n] = z.re * z.re + z.im * z.im;
+			n++;
+		}
+	}
+	// normalise to 0 dB at the centre: h = prod (b0 - b0 zc^2) / (1 + a1 zc + a2 zc^2), zc = e^{-iw}
+	double w = 2.0 * M_PI * sqrt(f_lo * f_hi) / fs;
+	bandCplx zc = {cos(w), -sin(w)};
+	bandCplx zc2 = {zc.re * zc.re - zc.im * zc.im, 2.0 * zc.re * zc.im};
+	bandCplx hh = {1.0, 0.0};
+	for (int i = 0; i < n; i++) {
+		bandCplx nu = {b0s[i] - b0s[i] * zc2.re, -b0s[i] * zc2.im};
+		bandCplx de = {1.0 + a1s[i] * zc.re + a2s[i] * zc2.re, a1s[i] * zc.im + a2s[i] * zc2.im};
+		bandCplx q = bandCplxDiv(nu, de);
+		bandCplx t = {hh.re * q.re - hh.im * q.im, hh.re * q.im + hh.im * q.re};
+		hh = t;
+	}
+	double g = 1.0 / fmax(sqrt(hh.re * hh.re + hh.im * hh.im), 1e-30);
+	b0s[0] *= g;
+	for (int i = 0; i < n; i++) {
+		g_bandB0[i][b] = (float)b0s[i]; g_bandA1[i][b] = (float)a1s[i]; g_bandA2[i][b] = (float)a2s[i];
+	}
+	return n;
+}
+static void bandmeter_design_named(double fs, int i)
+{
+	double lo = g_bandNamedEdges[i][0], hi = g_bandNamedEdges[i][1];
+	double f0 = sqrt(lo * hi), q = f0 / (hi - lo);
+	if (q < 0.7) q = 0.7; else if (q > 12.0) q = 12.0;
+	double w0 = 2.0 * M_PI * f0 / fs;
+	if (w0 >= M_PI) { g_bandNamedB0[i] = g_bandNamedA1[i] = g_bandNamedA2[i] = 0.0; return; }
+	double alpha = sin(w0) / (2.0 * q), a0 = 1.0 + alpha;
+	g_bandNamedB0[i] = alpha / a0;
+	g_bandNamedA1[i] = -2.0 * cos(w0) / a0;
+	g_bandNamedA2[i] = (1.0 - alpha) / a0;
+}
+// desktop norm_db(): linear magnitude -> 0..1 over BAND_DB_FLOOR..0 dBFS
+static inline double band_norm_db(double mag)
+{
+	double db = 20.0 * log10(mag + 1e-9);
+	double v = (db - BAND_DB_FLOOR) / (0.0 - BAND_DB_FLOOR);
+	return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+}
+// desktop BandEnvelope::update(): asymmetric one-pole follower
+static inline double band_env(double *state, double x)
+{
+	double coef = (x > *state) ? g_bandEnvAttack : g_bandEnvRelease;
+	*state = coef * *state + (1.0 - coef) * x;
+	return *state;
 }
 // --- Raw band-energy bridge (bands.bin) ------------------------------------
 // The 108 raw linear-RMS band energies are shared out through a memory-mapped
@@ -280,17 +371,24 @@ static void bandmeter_update_coeffs(double fs, double centerHz, double Q, int id
 // it as a sampler2D. Setup is idempotent and fails non-fatally (logged) if the
 // path isn't writable -- the meter keeps working, only the shm bridge is off.
 //
-// Layout (little-endian), v2 since 2026-10-10:
-//   [0, 432)    108 floats: the LATEST frame (unchanged v1 layout, so old
-//               readers that take the first 432 bytes keep working)
-//   [432, 464)  BandShmHeader below
-//   [464, ...)  ring: BAND_RING_LEN frames x 108 floats; frame k (0-based)
-//               lives in slot k % BAND_RING_LEN
+// Layout (little-endian), v3 since 2026-10-22 (v2 regions unchanged):
+//   [0, 432)    108 floats: the LATEST RAW frame (linear RMS per band; the
+//               v1 layout, so readers that take the first 432 bytes keep
+//               working and keep their tuning)
+//   [432, 464)  BandShmHeader below (version = 3)
+//   [464, R)    ring: BAND_RING_LEN raw frames x 108 floats; frame k (0-based)
+//               lives in slot k % BAND_RING_LEN; R = 464 + 32 * 432
+//   [R, R+432)  COOKED latest frame: 108 floats, desktop semantics (norm_db
+//               0..1 over -60..0 dBFS, 60/70 ms attack/release envelope)
+//   [R+432, +44) feature block, 11 floats in the desktop's meta order:
+//               rms, sub, bass, lowmid, mid, highmid, presence, brilliance,
+//               centroid, flux, onset (all 0..1, enveloped)
 // Each frame is the RMS over exactly fs / BAND_FRAME_HZ samples, no gaps.
-// Writer order: ring slot + latest + rms, then seq (release store) = number
-// of frames published. Reader: load seq (acquire), copy the frames it wants,
-// load seq again; any frame k < seq_after - BAND_RING_LEN may have been
-// overwritten during the copy and must be dropped.
+// Writer order: ring slot + latest + cooked + features + rms, then seq
+// (release store) = number of frames published. Reader: load seq (acquire),
+// copy what it wants, load seq again; any ring frame k < seq_after -
+// BAND_RING_LEN may have been overwritten during the copy and must be
+// dropped; a changed seq means the latest/cooked/feature copy may be torn.
 #define BAND_SHM_MAGIC (0x3242444Au) // "JDB2"
 typedef struct {
 	uint32_t magic;
@@ -303,11 +401,15 @@ typedef struct {
 	float rms;
 } BandShmHeader;
 #define BAND_SHM_RING_OFFSET (LUA_BAND_METER_COUNT * sizeof(float) + sizeof(BandShmHeader))
-#define BAND_SHM_SIZE (BAND_SHM_RING_OFFSET + \
+#define BAND_SHM_COOKED_OFFSET (BAND_SHM_RING_OFFSET + \
 		(size_t)BAND_RING_LEN * LUA_BAND_METER_COUNT * sizeof(float))
+#define BAND_SHM_FEAT_OFFSET (BAND_SHM_COOKED_OFFSET + LUA_BAND_METER_COUNT * sizeof(float))
+#define BAND_SHM_SIZE (BAND_SHM_FEAT_OFFSET + BAND_FEATURE_COUNT * sizeof(float))
 static float *g_bandShm = 0;
 static BandShmHeader *g_bandShmHeader = 0;
 static float *g_bandShmRing = 0;
+static float *g_bandShmCooked = 0;
+static float *g_bandShmFeat = 0;
 static void band_shm_setup(void)
 {
 	if (g_bandShm) return;
@@ -333,22 +435,52 @@ static void band_shm_setup(void)
 	g_bandShmHeader = (BandShmHeader *)((char *)p +
 			LUA_BAND_METER_COUNT * sizeof(float));
 	g_bandShmRing = (float *)((char *)p + BAND_SHM_RING_OFFSET);
+	g_bandShmCooked = (float *)((char *)p + BAND_SHM_COOKED_OFFSET);
+	g_bandShmFeat = (float *)((char *)p + BAND_SHM_FEAT_OFFSET);
 	memset(p, 0, BAND_SHM_SIZE);
 	g_bandShmHeader->magic = BAND_SHM_MAGIC;
-	g_bandShmHeader->version = 2;
+	g_bandShmHeader->version = 3;
 	g_bandShmHeader->ringLen = BAND_RING_LEN;
 	g_bandShmHeader->bands = LUA_BAND_METER_COUNT;
 	g_bandShmHeader->frameHz = (float)BAND_FRAME_HZ;
 }
-// One finished frame -> latest values, shm latest + ring, then seq.
+// One finished frame -> raw latest values, the cooked frame + features
+// (desktop shader_bands.cpp process() tail, transliterated), shm, then seq.
 static void band_publish(JamesDSPLib *jdsp)
 {
 	double inv = 1.0 / (double)jdsp->bandAccumCount;
+	double energy = 0.0, wfreq = 0.0, flux = 0.0;
 	for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
-		jdsp->bandLatest[b] = (float)sqrt(jdsp->bandAccum[b] * inv);
+		double raw = sqrt(jdsp->bandAccum[b] * inv);
+		jdsp->bandLatest[b] = (float)raw;
 		jdsp->bandAccum[b] = 0.0;
+		double rdb = band_norm_db(raw);
+		wfreq += rdb * (double)g_bandCenterHz[b];
+		energy += rdb;
+		double d = rdb - (double)jdsp->bandPrevDb[b];
+		if (d > 0.0) flux += d;
+		jdsp->bandPrevDb[b] = (float)rdb;
+		jdsp->bandCooked[b] = (float)band_env(&jdsp->bandEnv[b], rdb);
+	}
+	for (int i = 0; i < BAND_NAMED_COUNT; i++) {
+		double raw = sqrt(jdsp->bandNamedAccum[i] * inv);
+		jdsp->bandNamedAccum[i] = 0.0;
+		jdsp->bandFeatures[1 + i] = (float)band_env(&jdsp->bandNamedEnv[i], band_norm_db(raw));
 	}
 	jdsp->bandLatestRms = (float)sqrt(jdsp->bandAccumMono * inv);
+	jdsp->bandFeatures[0] = (float)band_env(&jdsp->bandRmsEnv, band_norm_db(jdsp->bandLatestRms));
+	double centroidHz = energy > 1e-9 ? wfreq / energy : 0.0;
+	double cn = centroidHz / BAND_LOG_HI; if (cn > 1.0) cn = 1.0;
+	jdsp->bandFeatures[8] = (float)band_env(&jdsp->bandCentroidEnv, cn);
+	// flux / onset: the desktop sums positive per-band dB steps per audio
+	// block; here per 60 Hz frame (same normalisation constants).
+	double fn = flux / (double)LUA_BAND_METER_COUNT * 8.0; if (fn > 1.0) fn = 1.0;
+	jdsp->bandFeatures[9] = (float)band_env(&jdsp->bandFluxEnv, fn);
+	jdsp->bandOnsetBaseline = g_bandOnsetBaselineCoef * jdsp->bandOnsetBaseline +
+			(1.0 - g_bandOnsetBaselineCoef) * flux;
+	double strength = flux - jdsp->bandOnsetBaseline; if (strength < 0.0) strength = 0.0;
+	double on = strength / (jdsp->bandOnsetBaseline + 1e-6); if (on > 1.0) on = 1.0;
+	jdsp->bandFeatures[10] = (float)band_env(&jdsp->bandOnsetEnv, on);
 	jdsp->bandAccumMono = 0.0;
 	jdsp->bandAccumCount = 0;
 	if (g_bandShm) {
@@ -356,42 +488,58 @@ static void band_publish(JamesDSPLib *jdsp)
 		memcpy(g_bandShmRing + (size_t)(k % BAND_RING_LEN) * LUA_BAND_METER_COUNT,
 				jdsp->bandLatest, LUA_BAND_METER_COUNT * sizeof(float));
 		memcpy(g_bandShm, jdsp->bandLatest, LUA_BAND_METER_COUNT * sizeof(float));
+		memcpy(g_bandShmCooked, jdsp->bandCooked, LUA_BAND_METER_COUNT * sizeof(float));
+		memcpy(g_bandShmFeat, jdsp->bandFeatures, BAND_FEATURE_COUNT * sizeof(float));
 		g_bandShmHeader->rms = jdsp->bandLatestRms;
 		g_bandShmHeader->sampleRate = (float)jdsp->fs;
 		__atomic_store_n(&g_bandShmHeader->seq, k + 1, __ATOMIC_RELEASE);
 	}
 	jdsp->bandFrameSeq++;
 }
-// Runs the 108 taps over every sample of the block (analysis only, reads
+// Runs the filter bank over every sample of the block (analysis only, reads
 // tmpBuffer, never writes it). Works in segments that end on frame
 // boundaries, so a frame is always exactly frameSamples long even when it
-// spans several blocks. Band-inner loop over local state so it vectorises.
+// spans several blocks. Per octave row the stage count is fixed, so the
+// inner loop is 12 contiguous bands x the row's stages; state is copied to
+// locals for the block so it vectorises.
 static void band_meter_process(JamesDSPLib *jdsp, size_t n)
 {
 	if (jdsp->bandMeterCoeffFs != jdsp->fs) {
+		const double half = 1.0293022366434920; // 2^(1/24)
 		for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
 			double centerHz = 27.5 * pow(2.0, (double)b / 12.0);
-			bandmeter_update_coeffs(jdsp->fs, centerHz, CHROMA_Q, b);
-			jdsp->bandMeterState1[b] = 0.0f;
-			jdsp->bandMeterState2[b] = 0.0f;
+			g_bandCenterHz[b] = (float)centerHz;
+			bandmeter_design_butter(jdsp->fs, centerHz / half, centerHz * half, g_bandOrders[b / 12], b);
 			jdsp->bandAccum[b] = 0.0;
+			jdsp->bandPrevDb[b] = 0.0f;
+			jdsp->bandEnv[b] = 0.0;
 		}
+		memset(jdsp->bandMeterState1, 0, sizeof(jdsp->bandMeterState1));
+		memset(jdsp->bandMeterState2, 0, sizeof(jdsp->bandMeterState2));
+		for (int i = 0; i < BAND_NAMED_COUNT; i++) {
+			bandmeter_design_named(jdsp->fs, i);
+			jdsp->bandNamedZ1[i] = jdsp->bandNamedZ2[i] = 0.0;
+			jdsp->bandNamedAccum[i] = 0.0;
+			jdsp->bandNamedEnv[i] = 0.0;
+		}
+		g_bandEnvAttack = exp(-1.0 / (BAND_FRAME_HZ * BAND_ENV_ATTACK_MS / 1000.0));
+		g_bandEnvRelease = exp(-1.0 / (BAND_FRAME_HZ * BAND_ENV_RELEASE_MS / 1000.0));
+		g_bandOnsetBaselineCoef = exp(-1.0 / (BAND_FRAME_HZ * BAND_ONSET_BASELINE_S));
+		jdsp->bandRmsEnv = jdsp->bandCentroidEnv = jdsp->bandFluxEnv = jdsp->bandOnsetEnv = 0.0;
+		jdsp->bandOnsetBaseline = 0.0;
 		jdsp->bandAccumMono = 0.0;
 		jdsp->bandAccumCount = 0;
 		jdsp->bandMeterCoeffFs = jdsp->fs;
 	}
 	int frameSamples = (int)(jdsp->fs / BAND_FRAME_HZ + 0.5);
 	if (frameSamples < 1) frameSamples = 1;
-	float s1[LUA_BAND_METER_COUNT], s2[LUA_BAND_METER_COUNT];
-	float b0[LUA_BAND_METER_COUNT], b2[LUA_BAND_METER_COUNT];
-	float a1[LUA_BAND_METER_COUNT], a2[LUA_BAND_METER_COUNT];
+	float z1[BAND_MAX_STAGES][LUA_BAND_METER_COUNT], z2[BAND_MAX_STAGES][LUA_BAND_METER_COUNT];
 	float sum[LUA_BAND_METER_COUNT];
-	memcpy(s1, jdsp->bandMeterState1, sizeof(s1));
-	memcpy(s2, jdsp->bandMeterState2, sizeof(s2));
-	memcpy(b0, g_bandMeterB0, sizeof(b0));
-	memcpy(b2, g_bandMeterB2, sizeof(b2));
-	memcpy(a1, g_bandMeterA1, sizeof(a1));
-	memcpy(a2, g_bandMeterA2, sizeof(a2));
+	double nz1[BAND_NAMED_COUNT], nz2[BAND_NAMED_COUNT], nsum[BAND_NAMED_COUNT];
+	memcpy(z1, jdsp->bandMeterState1, sizeof(z1));
+	memcpy(z2, jdsp->bandMeterState2, sizeof(z2));
+	memcpy(nz1, jdsp->bandNamedZ1, sizeof(nz1));
+	memcpy(nz2, jdsp->bandNamedZ2, sizeof(nz2));
 	const float *left = jdsp->tmpBuffer[0];
 	const float *right = jdsp->tmpBuffer[1];
 	size_t i = 0;
@@ -399,27 +547,48 @@ static void band_meter_process(JamesDSPLib *jdsp, size_t n)
 		size_t todo = (size_t)(frameSamples - jdsp->bandAccumCount);
 		if (todo > n - i) todo = n - i;
 		for (int b = 0; b < LUA_BAND_METER_COUNT; b++) sum[b] = 0.0f;
+		for (int q = 0; q < BAND_NAMED_COUNT; q++) nsum[q] = 0.0;
 		float monoSum = 0.0f;
 		for (size_t j = i; j < i + todo; j++) {
 			float mono = (left[j] + right[j]) * 0.5f;
 			monoSum += mono * mono;
-			for (int b = 0; b < LUA_BAND_METER_COUNT; b++) {
-				float y = b0[b] * mono + s1[b];
-				s1[b] = -a1[b] * y + s2[b]; // b1 == 0
-				s2[b] = b2[b] * mono - a2[b] * y;
-				sum[b] += y * y;
+			for (int q = 0; q < BAND_NAMED_COUNT; q++) {
+				double y = g_bandNamedB0[q] * mono + nz1[q];
+				nz1[q] = nz2[q] - g_bandNamedA1[q] * y;
+				nz2[q] = -g_bandNamedB0[q] * mono - g_bandNamedA2[q] * y;
+				nsum[q] += y * y;
+			}
+			for (int r = 0; r < BAND_ROWS; r++) {
+				const int ns = g_bandOrders[r], base = r * 12;
+				float x[12];
+				for (int jj = 0; jj < 12; jj++) x[jj] = mono;
+				for (int k = 0; k < ns; k++) {
+					const float *b0 = g_bandB0[k] + base, *a1 = g_bandA1[k] + base, *a2 = g_bandA2[k] + base;
+					float *s1 = z1[k] + base, *s2 = z2[k] + base;
+					for (int jj = 0; jj < 12; jj++) {
+						float y = b0[jj] * x[jj] + s1[jj];
+						s1[jj] = s2[jj] - a1[jj] * y;          // b1 == 0
+						s2[jj] = -b0[jj] * x[jj] - a2[jj] * y; // b2 == -b0
+						x[jj] = y;
+					}
+				}
+				for (int jj = 0; jj < 12; jj++) sum[base + jj] += x[jj] * x[jj];
 			}
 		}
 		for (int b = 0; b < LUA_BAND_METER_COUNT; b++)
 			jdsp->bandAccum[b] += (double)sum[b];
+		for (int q = 0; q < BAND_NAMED_COUNT; q++)
+			jdsp->bandNamedAccum[q] += nsum[q];
 		jdsp->bandAccumMono += (double)monoSum;
 		jdsp->bandAccumCount += (int)todo;
 		i += todo;
 		if (jdsp->bandAccumCount >= frameSamples)
 			band_publish(jdsp);
 	}
-	memcpy(jdsp->bandMeterState1, s1, sizeof(s1));
-	memcpy(jdsp->bandMeterState2, s2, sizeof(s2));
+	memcpy(jdsp->bandMeterState1, z1, sizeof(z1));
+	memcpy(jdsp->bandMeterState2, z2, sizeof(z2));
+	memcpy(jdsp->bandNamedZ1, nz1, sizeof(nz1));
+	memcpy(jdsp->bandNamedZ2, nz2, sizeof(nz2));
 }
 #endif // JDSP_LUA_BRIDGE
 // Flush-to-zero for denormals: reverb tails, delay lines, and IIR filter
