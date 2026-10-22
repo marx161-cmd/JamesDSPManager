@@ -16,6 +16,7 @@
 #include "lsp_wrap_expander.h"
 #include "lsp_wrap_autogain.h"
 #include "lsp_wrap_loudcomp.h"
+#include "lsp_wrap_mbcomp.h"
 #include "chain_modules.h"
 #define TAG "EffectDSPMain"
 
@@ -584,6 +585,10 @@ static void w_gate_lsp(float *L, float *R, unsigned n)   { lua_bridge_hook_fire(
 // Expander: same contract as gate/compressor above -- always called, owns
 // its Bypass crossfade, no jdsp_lock (rt_config.h handoff).
 static void w_expander(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("expander", L, R, (int)n); lsp_exp_process(g_chain_jdsp->expander_handle, L, R, n, g_chain_jdsp->expanderEnabled); }
+// Multiband compressor: real LSP mb_compressor port (lsp_wrap_mbcomp.cpp,
+// 2026-10-22). Same contract as gate/compressor/expander: always called,
+// owns its Bypass crossfade, no jdsp_lock (rt_config.h handoff).
+static void w_mbcomp(float *L, float *R, unsigned n)     { lua_bridge_hook_fire("mbcomp", L, R, (int)n); lsp_mbcomp_process(g_chain_jdsp->mbcomp_handle, L, R, n, g_chain_jdsp->mbcompEnabled); }
 // Autogain: real LSP Autogain port (lsp_wrap_autogain.cpp) replaced the
 // chain_modules.c RMS integrator (2026-10-21). Same contract as gate/
 // compressor: always called, owns its Bypass crossfade, no jdsp_lock.
@@ -622,6 +627,9 @@ static void chain_init_static(void) {
 	// not via chain_process()'s hard skip.
 	chain_register("gate",       w_gate_lsp,         NULL);
 	chain_register("expander",   w_expander,         NULL);
+	// mbcomp: index 3; placed by default_order[] below right after the
+	// expander and before autogain.
+	chain_register("mbcomp",     w_mbcomp,           NULL);
 	chain_register("tube",       w_tube,             &g_chain_jdsp->tubeEnabled);
 	chain_register("compressor", w_mb_dyn,           NULL);
 	chain_register("bassboost",  w_bassboost,        &g_chain_jdsp->bassBoostEnabled);
@@ -638,10 +646,17 @@ static void chain_init_static(void) {
 	chain_register("loudcomp",   w_loudcomp,         NULL);
 	chain_register("lua",        w_lua_process,      NULL);
 
-	// Order matches stock's original chain position: bass boost right after
-	// the compressor, before EQ.
-	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-	chain_set_order(default_order, 16);
+	// Processing order = this index list into the registration list above
+	// (NOT the registration order). Stock's original chain position is kept:
+	// bass boost right after the compressor, before EQ. 2026-10-22: mbcomp (3)
+	// sits right after the expander (2) and BEFORE autogain (0), so the audio
+	// path is gate -> expander -> mbcomp -> autogain -> tube -> compressor ...
+	// (autogain used to be first; it now levels the band-compressed signal).
+	// Registration order is the processing order: autogain stays first (stock
+	// behaviour, the legacy integrator ran at the input), then gate, expander,
+	// mbcomp (right after the expander), tube, compressor, ... loudcomp, lua tap.
+	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+	chain_set_order(default_order, 17);
 }
 
 // Process
@@ -667,16 +682,17 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 		lua_bridge_set_sample_rate((int)jdsp->fs);
 		lua_bridge_set_postgain(jdsp->postGain);
 		// Order must match g_module_names[] in lua_bridge.c
-		int moduleStates[15] = {
+		int moduleStates[16] = {
 			jdsp->gateEnabled, jdsp->mbDynEnabled, jdsp->autogainEnabled,
 			jdsp->reverbEnabled, jdsp->sterEnhEnabled, jdsp->tubeEnabled,
 			jdsp->convolverEnabled, jdsp->equalizerEnabled, jdsp->crossfeedEnabled,
 			jdsp->ddcEnabled, jdsp->arbitraryMagEnabled, jdsp->liveprogEnabled,
 			1, // lua module always runs (self-gating)
 			jdsp->expanderEnabled,
-			jdsp->loudcompEnabled
+			jdsp->loudcompEnabled,
+			jdsp->mbcompEnabled
 		};
-		lua_bridge_set_module_states(moduleStates, 15);
+		lua_bridge_set_module_states(moduleStates, 16);
 
 		// Telemetry properties (mpv-style property tree). These are live
 		// values refreshed each tick; the limiter runs *after* this tick, so
@@ -701,6 +717,8 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 			(double)lsp_autogain_get_input_lufs(jdsp->autogain_handle));
 		lua_bridge_set_property_number("loudcomp.latency_samples",
 			(double)lsp_loudcomp_get_latency(jdsp->loudcomp_handle));
+		lua_bridge_set_property_number("mbcomp.latency_samples",
+			(double)lsp_mbcomp_get_latency(jdsp->mbcomp_handle));
 		lua_bridge_set_property_number("convolver.active",
 			(jdsp->convolverEnabled && jdsp->conv.process != NULL) ? 1.0 : 0.0);
 		lua_bridge_set_property_number("convolver.impulse_length",
@@ -1530,6 +1548,14 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	// Inert until loudcompEnabled is set (zero-init off, Bypass engaged).
 	jdsp->loudcomp_handle = lsp_loudcomp_create(sample_rate);
 	lsp_loudcomp_configure(jdsp->loudcomp_handle, 0.0f, 0, 4, 4, 2, 0.0f, 0, 6.0f);
+	// Multiband compressor defaults = the real plugin's metadata defaults
+	// (lsp-mb-compressor/include/private/meta/mb_compressor.h + the
+	// mb_compressor_stereo_ports[] table), filled by lsp_mbcomp_default_config()
+	// (Modern mode, splits 2/4/6 on at 100/632/3984 Hz, ratio 1, -12 dB attack
+	// level, RMS sidechain 10 ms, Pink BT envelope boost). lsp_mbcomp_create()
+	// already applied them once (the real host's first update_settings()).
+	// Inert until mbcompEnabled is set (zero-init off, Bypass engaged).
+	jdsp->mbcomp_handle = lsp_mbcomp_create(sample_rate);
 	lsp_comp_configure(jdsp->compressor_handle, -24.0f, 4.0f, 1.0f, 5.0f, 100.0f, 10.0f);
 }
 void JamesDSPSetPostGain(JamesDSPLib *jdsp, double pGaindB)
@@ -1613,12 +1639,14 @@ void JamesDSPFree(JamesDSPLib *jdsp)
 	lsp_exp_destroy(jdsp->expander_handle);
 	lsp_autogain_destroy(jdsp->autogain_handle);
 	lsp_loudcomp_destroy(jdsp->loudcomp_handle);
+	lsp_mbcomp_destroy(jdsp->mbcomp_handle);
 	lsp_limiter_destroy(jdsp->limiter_handle);
 	jdsp->compressor_handle = NULL;
 	jdsp->gate_handle = NULL;
 	jdsp->expander_handle = NULL;
 	jdsp->autogain_handle = NULL;
 	jdsp->loudcomp_handle = NULL;
+	jdsp->mbcomp_handle = NULL;
 	jdsp->limiter_handle = NULL;
 	if (jdsp->luaScript) {
 		free(jdsp->luaScript);

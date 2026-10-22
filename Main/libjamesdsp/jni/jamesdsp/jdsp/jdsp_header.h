@@ -584,6 +584,11 @@ typedef struct dspsys
 	// Defaults off via the struct's zero-init.
 	void *loudcomp_handle;
 	int loudcompEnabled;
+	// Multiband compressor (LSP mb_compressor faithful port, lsp_wrap_mbcomp.cpp),
+	// cmd 10106; chain position right after the expander. Defaults off via the
+	// struct's zero-init.
+	void *mbcomp_handle;
+	int mbcompEnabled;
 	size_t blockSize, blockSizeMax, pw2BlockMemSize;
 	float *tmpBuffer[6];
 	// Internal function pointer

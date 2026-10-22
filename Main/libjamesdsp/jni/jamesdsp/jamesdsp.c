@@ -16,6 +16,7 @@
 #include "lsp_wrap_expander.h"
 #include "lsp_wrap_autogain.h"
 #include "lsp_wrap_loudcomp.h"
+#include "lsp_wrap_mbcomp.h"
 typedef struct
 {
 	unsigned long long initializeForFirst;
@@ -149,6 +150,17 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
         d->jdsp.loudcompEnabled = (int)params[0];
         if (nparams >= 9 && d->jdsp.loudcompEnabled) {
             lsp_loudcomp_configure(d->jdsp.loudcomp_handle, params[1], (int)params[2], (int)params[3], (int)params[4], (int)params[5], params[6], (int)params[7], params[8]);
+        }
+        return 0;
+    }
+    // Multiband compressor (10106): {en[, <LSP_MBCOMP_NPARAMS = 216 config
+    // floats in the lsp_wrap_mbcomp.h layout: 10 globals, 7 x (split enable,
+    // freq), 8 x 24 band params>]}. Enable-only (nparams == 1) just flips the
+    // flag (Lua toggle_module); the full 217-float bundle reconfigures.
+    if (cmd == 10106 && nparams >= 1) {
+        d->jdsp.mbcompEnabled = (int)params[0];
+        if (nparams >= 1 + LSP_MBCOMP_NPARAMS && d->jdsp.mbcompEnabled) {
+            lsp_mbcomp_configure(d->jdsp.mbcomp_handle, &params[1], (unsigned)(nparams - 1));
         }
         return 0;
     }
@@ -937,6 +949,33 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				if (en) {
 					lsp_loudcomp_configure(dspmain->jdsp.loudcomp_handle, p[6], (int)roundf(p[7]), (int)roundf(p[8]),
 					                       (int)roundf(p[9]), (int)roundf(p[10]), p[11], (int)roundf(p[12]), p[13]);
+				}
+				*replyData = 0;
+				return 0;
+			}
+		}
+		// Multiband compressor (10106): LSP_MBCOMP_PAYLOAD_FLOATS = 218-float
+		// payload (872 bytes) at int32 index 4..221 = [band(unused)=0, enabled,
+		// then the 216-float configuration block documented in lsp_wrap_mbcomp.h:
+		// globals (mode 0 Classic/1 Modern/2 Linear Phase, in/out/dry/wet gain dB,
+		// dry/wet %, reactivity, shift dB, envelope boost 0..4, stereo split),
+		// 7 x [split enable, split freq Hz], 8 x 24 band params (enabled, solo,
+		// mute, comp mode, sc mode, sc source, split sc source, lookahead ms,
+		// sc reactivity ms, sc preamp dB, lo-cut on, hi-cut on, lo-cut Hz,
+		// hi-cut Hz, attack dB, attack ms, release dB, release ms, ratio,
+		// knee dB, makeup dB, boost thresh dB, boost signal dB, hold ms)].
+		// No jdsp_lock (lsp_mbcomp_configure publishes, the audio thread applies
+		// -- rt_config.h).
+		if (cep->psize == 4 && cep->vsize == LSP_MBCOMP_PAYLOAD_FLOATS * 4)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 10106)
+			{
+				float *p = (float *)cep;
+				int en = (int)roundf(p[5]);
+				dspmain->jdsp.mbcompEnabled = en;
+				if (en) {
+					lsp_mbcomp_configure(dspmain->jdsp.mbcomp_handle, &p[6], LSP_MBCOMP_NPARAMS);
 				}
 				*replyData = 0;
 				return 0;
