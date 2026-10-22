@@ -579,6 +579,11 @@ typedef struct dspsys
 	// legacy chain_modules.c RMS integrator; enable flag is the existing
 	// autogainEnabled above (cmd 1207).
 	void *autogain_handle;
+	// Loudness compensation (LSP loud_comp faithful port, lsp_wrap_loudcomp.cpp),
+	// cmd 10105; last chain module before the output limiter / post gain.
+	// Defaults off via the struct's zero-init.
+	void *loudcomp_handle;
+	int loudcompEnabled;
 	size_t blockSize, blockSizeMax, pw2BlockMemSize;
 	float *tmpBuffer[6];
 	// Internal function pointer

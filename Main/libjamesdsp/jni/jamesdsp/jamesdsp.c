@@ -15,6 +15,7 @@
 #include "lsp_wrap.h"
 #include "lsp_wrap_expander.h"
 #include "lsp_wrap_autogain.h"
+#include "lsp_wrap_loudcomp.h"
 typedef struct
 {
 	unsigned long long initializeForFirst;
@@ -138,6 +139,16 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
         d->jdsp.autogainEnabled = (int)params[0];
         if (nparams >= 8 && d->jdsp.autogainEnabled) {
             lsp_autogain_configure(d->jdsp.autogain_handle, params[1], params[2], params[3], params[4], params[5], params[6], (int)params[7]);
+        }
+        return 0;
+    }
+    // Loudness compensation (10105): {en[, input_gain_db, mode(0 FFT/1 IIR),
+    // std(0 Flat..4 ISO226-2023), fft_rank_idx(0..6), approx(0..4),
+    // volume_phons, hclip, hcrange_db]}
+    if (cmd == 10105 && nparams >= 1) {
+        d->jdsp.loudcompEnabled = (int)params[0];
+        if (nparams >= 9 && d->jdsp.loudcompEnabled) {
+            lsp_loudcomp_configure(d->jdsp.loudcomp_handle, params[1], (int)params[2], (int)params[3], (int)params[4], (int)params[5], params[6], (int)params[7], params[8]);
         }
         return 0;
     }
@@ -903,6 +914,29 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				dspmain->jdsp.autogainEnabled = en;
 				if (en) {
 					lsp_autogain_configure(dspmain->jdsp.autogain_handle, p[6], p[7], p[8], p[9], p[10], p[11], (int)roundf(p[12]));
+				}
+				*replyData = 0;
+				return 0;
+			}
+		}
+		// Loudness compensation (10105): 10-float payload (40 bytes) at int32
+		// index 4..13 = [band(unused)=0, enabled, input gain dB, mode (0 FFT /
+		// 1 IIR), std (0 Flat, 1 ISO226-2003, 2 Fletcher-Munson, 3 Robinson-
+		// Dadson, 4 ISO226-2023), fft rank idx (0..6 = 256..16384), approx
+		// (0..4 Fastest..Best), volume phons (-83..7), hclip, hcrange dB (0..24)].
+		// No jdsp_lock (lsp_loudcomp_configure publishes, the audio thread
+		// applies -- rt_config.h).
+		if (cep->psize == 4 && cep->vsize == 40)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 10105)
+			{
+				float *p = (float *)cep;
+				int en = (int)roundf(p[5]);
+				dspmain->jdsp.loudcompEnabled = en;
+				if (en) {
+					lsp_loudcomp_configure(dspmain->jdsp.loudcomp_handle, p[6], (int)roundf(p[7]), (int)roundf(p[8]),
+					                       (int)roundf(p[9]), (int)roundf(p[10]), p[11], (int)roundf(p[12]), p[13]);
 				}
 				*replyData = 0;
 				return 0;

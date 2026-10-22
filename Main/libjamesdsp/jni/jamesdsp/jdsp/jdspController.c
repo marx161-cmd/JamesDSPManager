@@ -15,6 +15,7 @@
 #include "lsp_wrap.h"
 #include "lsp_wrap_expander.h"
 #include "lsp_wrap_autogain.h"
+#include "lsp_wrap_loudcomp.h"
 #include "chain_modules.h"
 #define TAG "EffectDSPMain"
 
@@ -587,6 +588,12 @@ static void w_expander(float *L, float *R, unsigned n)   { lua_bridge_hook_fire(
 // chain_modules.c RMS integrator (2026-10-21). Same contract as gate/
 // compressor: always called, owns its Bypass crossfade, no jdsp_lock.
 static void w_autogain(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("autogain", L, R, (int)n); lsp_autogain_process(g_chain_jdsp->autogain_handle, L, R, n, g_chain_jdsp->autogainEnabled); }
+// Loudness compensation: real LSP loud_comp port (lsp_wrap_loudcomp.cpp).
+// Same contract as gate/compressor: always called, owns its Bypass
+// crossfade, no jdsp_lock. Registered LAST before the Lua tap so it sits
+// after every tone-shaping stage (EQ, convolver, DDC, reverb...) and right
+// before the postGain + output limiter at the end of JamesDSPProcess().
+static void w_loudcomp(float *L, float *R, unsigned n)   { lua_bridge_hook_fire("loudcomp", L, R, (int)n); lsp_loudcomp_process(g_chain_jdsp->loudcomp_handle, L, R, n, g_chain_jdsp->loudcompEnabled); }
 // No chain wrapper for the limiter: it's applied once, explicitly, at the
 // end of JamesDSPProcess() after postGain — that's the real "last line of
 // defense" position. It used to ALSO run mid-chain via chain_register()
@@ -626,12 +633,15 @@ static void chain_init_static(void) {
 	chain_register("crossfeed",  w_crossfeed,        &g_chain_jdsp->crossfeedEnabled);
 	chain_register("stereo",     w_stereo,           &g_chain_jdsp->sterEnhEnabled);
 	chain_register("reverb",     w_reverb,           &g_chain_jdsp->reverbEnabled);
+	// loudcomp: last processing module (after all tone shaping, before the
+	// Lua monitoring tap and the postGain/limiter tail of JamesDSPProcess()).
+	chain_register("loudcomp",   w_loudcomp,         NULL);
 	chain_register("lua",        w_lua_process,      NULL);
 
 	// Order matches stock's original chain position: bass boost right after
 	// the compressor, before EQ.
-	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
-	chain_set_order(default_order, 15);
+	int default_order[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+	chain_set_order(default_order, 16);
 }
 
 // Process
@@ -657,15 +667,16 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 		lua_bridge_set_sample_rate((int)jdsp->fs);
 		lua_bridge_set_postgain(jdsp->postGain);
 		// Order must match g_module_names[] in lua_bridge.c
-		int moduleStates[14] = {
+		int moduleStates[15] = {
 			jdsp->gateEnabled, jdsp->mbDynEnabled, jdsp->autogainEnabled,
 			jdsp->reverbEnabled, jdsp->sterEnhEnabled, jdsp->tubeEnabled,
 			jdsp->convolverEnabled, jdsp->equalizerEnabled, jdsp->crossfeedEnabled,
 			jdsp->ddcEnabled, jdsp->arbitraryMagEnabled, jdsp->liveprogEnabled,
 			1, // lua module always runs (self-gating)
-			jdsp->expanderEnabled
+			jdsp->expanderEnabled,
+			jdsp->loudcompEnabled
 		};
-		lua_bridge_set_module_states(moduleStates, 14);
+		lua_bridge_set_module_states(moduleStates, 15);
 
 		// Telemetry properties (mpv-style property tree). These are live
 		// values refreshed each tick; the limiter runs *after* this tick, so
@@ -688,6 +699,8 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 			(double)lsp_autogain_get_gain_db(jdsp->autogain_handle));
 		lua_bridge_set_property_number("autogain.input_lufs",
 			(double)lsp_autogain_get_input_lufs(jdsp->autogain_handle));
+		lua_bridge_set_property_number("loudcomp.latency_samples",
+			(double)lsp_loudcomp_get_latency(jdsp->loudcomp_handle));
 		lua_bridge_set_property_number("convolver.active",
 			(jdsp->convolverEnabled && jdsp->conv.process != NULL) ? 1.0 : 0.0);
 		lua_bridge_set_property_number("convolver.impulse_length",
@@ -1510,6 +1523,13 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	// SILENCE_DFL = -72 LUFS, MAX_GAIN_DFL = 36 dB, max_on SWITCH dfl 0.
 	jdsp->autogain_handle = lsp_autogain_create(sample_rate);
 	lsp_autogain_configure(jdsp->autogain_handle, -23.0f, 400.0f, 20.0f, 12.0f, -72.0f, 36.0f, 0);
+	// Loudness compensation defaults = the real plugin's metadata defaults
+	// (lsp-loud-comp/include/private/meta/loud_comp.h + meta/loud_comp.cpp):
+	// input 0 dB, mode FFT (0), std ISO226-2023 (STD_DFL 4), FFT_RANK_IDX_DFL 4
+	// (4096), approx Normal (2), PHONS_DFL 0, hclip off, HCRANGE_DFL 6 dB.
+	// Inert until loudcompEnabled is set (zero-init off, Bypass engaged).
+	jdsp->loudcomp_handle = lsp_loudcomp_create(sample_rate);
+	lsp_loudcomp_configure(jdsp->loudcomp_handle, 0.0f, 0, 4, 4, 2, 0.0f, 0, 6.0f);
 	lsp_comp_configure(jdsp->compressor_handle, -24.0f, 4.0f, 1.0f, 5.0f, 100.0f, 10.0f);
 }
 void JamesDSPSetPostGain(JamesDSPLib *jdsp, double pGaindB)
@@ -1592,11 +1612,13 @@ void JamesDSPFree(JamesDSPLib *jdsp)
 	lsp_gate_destroy(jdsp->gate_handle);
 	lsp_exp_destroy(jdsp->expander_handle);
 	lsp_autogain_destroy(jdsp->autogain_handle);
+	lsp_loudcomp_destroy(jdsp->loudcomp_handle);
 	lsp_limiter_destroy(jdsp->limiter_handle);
 	jdsp->compressor_handle = NULL;
 	jdsp->gate_handle = NULL;
 	jdsp->expander_handle = NULL;
 	jdsp->autogain_handle = NULL;
+	jdsp->loudcomp_handle = NULL;
 	jdsp->limiter_handle = NULL;
 	if (jdsp->luaScript) {
 		free(jdsp->luaScript);
