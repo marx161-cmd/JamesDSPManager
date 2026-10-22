@@ -1,3 +1,13 @@
+> **Fork note (marx161-cmd, 2026):** this is the engine used by a rebuilt crDroid/Pixel 10 Pro vendor
+> audio effect. Changes vs upstream: faithful ports of the lsp-plugins Gate / Compressor / Limiter /
+> Expander / Autogain / Loudness Compensator / Multiband Compressor (differential-tested against the real
+> plugins), SVE2 FFT, lock-free config handoff, a desktop-identical 108-band Butterworth meter (`bands.bin`)
+> and an output tap. Builds, benchmarks and the full list of related repos (app, vendor glue, the
+> [ShaderEditor](https://github.com/marx161-cmd/ShaderEditor) and
+> [termux-app](https://github.com/marx161-cmd/termux-app) forks the stack runs on):
+> [proprietary_vendor_JamesDSP/release/README.md](https://github.com/marx161-cmd/proprietary_vendor_JamesDSP/blob/master/release/README.md).
+> Proof of concept, not maintained.
+
 # JamesDSP (Cross-platform Audio Effect / Digital Signal Processing library)
 GUI is based on Omnirom DSP Manager and able to run on most Android devices from 5 to 10 include AOSP, Cyanogenmod, Huawei(arm64), LineageOS, Samsung and recent HTC. 
 This app include many cool features.
