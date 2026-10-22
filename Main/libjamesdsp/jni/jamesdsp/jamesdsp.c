@@ -164,6 +164,16 @@ static int lua_cmd_dispatch(int cmd, const float *params, int nparams) {
         }
         return 0;
     }
+    // Desk send tap (10107): {en[, mute_local, gain_db]} (tap_publish() in
+    // jdspController.c; plain field stores, read once per block).
+    if (cmd == 10107 && nparams >= 1) {
+        d->jdsp.tapEnabled = (int)params[0];
+        if (nparams >= 3) {
+            d->jdsp.tapMuteLocal = (int)params[1];
+            d->jdsp.tapGain = powf(10.0f, params[2] / 20.0f);
+        }
+        return 0;
+    }
 
     // Tube drive (150): params[0] = drive (0.0 = off)
     if (cmd == 150 && nparams >= 1) {
@@ -977,6 +987,24 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				if (en) {
 					lsp_mbcomp_configure(dspmain->jdsp.mbcomp_handle, &p[6], LSP_MBCOMP_NPARAMS);
 				}
+				*replyData = 0;
+				return 0;
+			}
+		}
+		// Desk send tap (10107): 7-float payload (28 bytes) at int32 index
+		// 4..10 = [band(unused)=0, enabled, mute local, gain dB, 0, 0, 0].
+		// Padded to 7 floats because 28 is the only block size this
+		// vsize-keyed dispatch had left. Plain field stores, read once per
+		// block by tap_publish() -- no jdsp_lock.
+		if (cep->psize == 4 && cep->vsize == 28)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 10107)
+			{
+				float *p = (float *)cep;
+				dspmain->jdsp.tapEnabled = (int)roundf(p[5]);
+				dspmain->jdsp.tapMuteLocal = (int)roundf(p[6]);
+				dspmain->jdsp.tapGain = powf(10.0f, p[7] / 20.0f);
 				*replyData = 0;
 				return 0;
 			}

@@ -444,6 +444,95 @@ static void band_shm_setup(void)
 	g_bandShmHeader->bands = LUA_BAND_METER_COUNT;
 	g_bandShmHeader->frameHz = (float)BAND_FRAME_HZ;
 }
+
+// --- Desk send: output tap ring (tap.bin) ---------------------------------
+// The post-chain stereo output (after postGain + limiter, i.e. exactly what
+// the phone plays) as int16 interleaved frames in a memory-mapped ring, for a
+// userspace sender (vendor tools/jdsp_tap_send.c) that ships it to the desk
+// speaker over UDP. Same discipline as bands.bin: setup once at effect init,
+// pure memory writes on the audio thread, non-fatal if the path isn't
+// writable. Off by default (cmd 10107).
+//
+// Layout (little-endian):
+//   [0, 32)                 TapShmHeader; seq = total frames written (release
+//                           store); frame k lives in ring slot k % ringFrames
+//   [32, 32 + ringFrames*4) ring of int16 L,R pairs
+// Reader: load seq (acquire), copy, load seq again; any frame older than
+// seq_after - ringFrames may have been overwritten and must be dropped.
+// flags mirror the command so the sender can idle without a side channel.
+#define TAP_SHM_MAGIC (0x5054444Au) // "JDTP"
+#define TAP_RING_FRAMES (32768u)    // power of two; 0.68 s at 48 kHz
+typedef struct {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t seq;
+	uint32_t ringFrames;
+	uint32_t channels;
+	uint32_t sampleRate;
+	uint32_t flags; // bit 0 enabled, bit 1 mute local
+	uint32_t reserved;
+} TapShmHeader;
+#define TAP_SHM_SIZE (sizeof(TapShmHeader) + (size_t)TAP_RING_FRAMES * 2 * sizeof(int16_t))
+static TapShmHeader *g_tapShmHeader = 0;
+static int16_t *g_tapShmRing = 0;
+static void tap_shm_setup(void)
+{
+	if (g_tapShmHeader) return;
+	const char *path = "/data/data/com.termux.jdsp/files/tap.bin";
+	int fd = open(path, O_RDWR | O_CREAT, 0666);
+	if (fd < 0) {
+		__android_log_print(ANDROID_LOG_WARN, TAG, "tap shm open failed: %s", path);
+		return;
+	}
+	if (ftruncate(fd, (off_t)TAP_SHM_SIZE) != 0) {
+		__android_log_print(ANDROID_LOG_WARN, TAG, "tap shm ftruncate failed");
+		close(fd);
+		return;
+	}
+	fchmod(fd, 0644);
+	void *p = mmap(0, TAP_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (p == MAP_FAILED) {
+		__android_log_print(ANDROID_LOG_WARN, TAG, "tap shm mmap failed");
+		return;
+	}
+	memset(p, 0, TAP_SHM_SIZE);
+	TapShmHeader *h = (TapShmHeader *)p;
+	h->magic = TAP_SHM_MAGIC;
+	h->version = 1;
+	h->ringFrames = TAP_RING_FRAMES;
+	h->channels = 2;
+	g_tapShmRing = (int16_t *)((char *)p + sizeof(TapShmHeader));
+	g_tapShmHeader = h;
+}
+// Called at the very end of JamesDSPProcess(): copies the block into the
+// ring (with the tap gain), publishes seq, then silences the phone's own
+// output if "mute local" is on (the track volume is applied BEFORE the
+// effect, so muting the phone normally would mute the tap too).
+static inline void tap_publish(JamesDSPLib *jdsp, size_t n)
+{
+	TapShmHeader *h = g_tapShmHeader;
+	if (!h) return;
+	uint32_t flags = (jdsp->tapEnabled ? 1u : 0u) | (jdsp->tapMuteLocal ? 2u : 0u);
+	if (h->flags != flags) h->flags = flags;
+	if (h->sampleRate != (uint32_t)jdsp->fs) h->sampleRate = (uint32_t)jdsp->fs;
+	if (!jdsp->tapEnabled) return;
+	float g = (jdsp->tapGain > 0.0f ? jdsp->tapGain : 1.0f) * 32767.0f;
+	uint32_t seq = h->seq;
+	for (size_t i = 0; i < n; i++) {
+		uint32_t slot = (seq + (uint32_t)i) & (TAP_RING_FRAMES - 1u);
+		float l = jdsp->tmpBuffer[0][i] * g, r = jdsp->tmpBuffer[1][i] * g;
+		l = l > 32767.0f ? 32767.0f : (l < -32768.0f ? -32768.0f : l);
+		r = r > 32767.0f ? 32767.0f : (r < -32768.0f ? -32768.0f : r);
+		g_tapShmRing[2 * slot] = (int16_t)lrintf(l);
+		g_tapShmRing[2 * slot + 1] = (int16_t)lrintf(r);
+	}
+	__atomic_store_n(&h->seq, seq + (uint32_t)n, __ATOMIC_RELEASE);
+	if (jdsp->tapMuteLocal) {
+		memset(jdsp->tmpBuffer[0], 0, n * sizeof(float));
+		memset(jdsp->tmpBuffer[1], 0, n * sizeof(float));
+	}
+}
 // One finished frame -> raw latest values, the cooked frame + features
 // (desktop shader_bands.cpp process() tail, transliterated), shm, then seq.
 static void band_publish(JamesDSPLib *jdsp)
@@ -928,6 +1017,10 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	// No jdsp_lock: limiter configure() publishes, process() applies (rt_config.h).
 	if (jdsp->limiterEnabled)
 		lsp_limiter_process(jdsp->limiter_handle, jdsp->tmpBuffer[0], jdsp->tmpBuffer[1], (unsigned)n);
+#if JDSP_LUA_BRIDGE
+	// Desk send: tap the final output (and mute the phone's copy if asked).
+	tap_publish(jdsp, n);
+#endif
 }
 void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 {
@@ -1670,6 +1763,7 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	// here (effect init) so the mmap/open/truncate syscalls happen once, off
 	// the realtime processing path.
 	band_shm_setup();
+	tap_shm_setup();
 	// Auto-load a user script from a fixed path if present, mirroring mpv's
 	// scripts/-folder auto-load convenience — no UI/AIDL round-trip needed.
 	// Only one script slot exists (lua_bridge_load_script replaces globals

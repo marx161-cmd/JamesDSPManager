@@ -608,6 +608,14 @@ typedef struct dspsys
 	// struct's zero-init.
 	void *mbcomp_handle;
 	int mbcompEnabled;
+	// Desk send (2026-10-22): post-chain output tap (after postGain + limiter)
+	// into the shared ring file tap.bin, read by a userspace sender for the
+	// desk speaker; cmd 10107 {enabled, mute local, gain dB}. Full variant
+	// only (tap_publish() in jdspController.c is under JDSP_LUA_BRIDGE).
+	// Defaults off via the struct's zero-init; tapGain 0 means unity.
+	int tapEnabled;
+	int tapMuteLocal;
+	float tapGain;
 	size_t blockSize, blockSizeMax, pw2BlockMemSize;
 	float *tmpBuffer[6];
 	// Internal function pointer
